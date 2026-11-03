@@ -31,6 +31,12 @@ struct vkr_resource {
       uint8_t *data;
    } u;
 
+   /* With fd_type shm, the shm fd behind u.data (owned), or -1.  Kept so
+    * the memory can be mapped again and imported into the driver as host
+    * memory, independent of the lifetime of this resource.
+    */
+   int shm_fd;
+
    size_t size;
 };
 

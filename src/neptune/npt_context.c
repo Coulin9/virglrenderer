@@ -1820,6 +1820,14 @@ npt_context_create_resource(struct npt_context *ctx,
          .map_info = 0,
          .export_format = pb->virgl_format,
       };
+#ifdef __APPLE__
+      /* Shared textures use write-back SHM on Metal. Mappable blobs need
+       * an explicit cache policy; CACHE_NONE makes RESOURCE_MAP_BLOB fail.
+       */
+      if (pb->fd_type == VIRGL_RESOURCE_FD_SHM &&
+          (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE))
+         out_blob->map_info = VIRGL_RENDERER_MAP_CACHE_CACHED;
+#endif
       free(pb);
 
       return true;

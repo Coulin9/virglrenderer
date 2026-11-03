@@ -189,9 +189,11 @@ static inline void
 vkr_context_free_resource(struct hash_entry *entry)
 {
    struct vkr_resource *res = entry->data;
-   if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
+   if (res->fd_type == VIRGL_RESOURCE_FD_SHM) {
       munmap(res->u.data, res->size);
-   else if (res->u.fd >= 0)
+      if (res->shm_fd >= 0)
+         close(res->shm_fd);
+   } else if (res->u.fd >= 0)
       close(res->u.fd);
    free(res);
 }
@@ -238,12 +240,16 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
    res->fd_type = fd_type;
    res->size = blob_size;
 
-   /* fd and mmap_ptr cannot be valid at the same time, but allowed to be -1 and NULL */
-   assert(fd < 0 || !mmap_ptr);
-   if (mmap_ptr)
+   /* With mmap_ptr (shm), fd is the shm fd behind it or -1.  Ownership of fd
+    * passes to the resource only on success.
+    */
+   res->shm_fd = -1;
+   if (mmap_ptr) {
       res->u.data = mmap_ptr;
-   else
+      res->shm_fd = fd;
+   } else {
       res->u.fd = fd;
+   }
 
    if (!vkr_context_add_resource(ctx, res)) {
       free(res);
@@ -266,7 +272,7 @@ vkr_context_import_resource_from_shm(struct vkr_context *ctx,
       return false;
 
    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size,
-                                             VIRGL_RESOURCE_FD_SHM, -1, mmap_ptr)) {
+                                             VIRGL_RESOURCE_FD_SHM, fd, mmap_ptr)) {
       munmap(mmap_ptr, blob_size);
       return false;
    }
@@ -298,8 +304,12 @@ vkr_context_create_resource_from_shm(struct vkr_context *ctx,
       return false;
    }
 
-   if (!vkr_context_import_resource_internal(ctx, res_id, alloc_size,
-                                             VIRGL_RESOURCE_FD_SHM, -1, mmap_ptr)) {
+   const int res_fd = os_dupfd_cloexec(fd);
+   if (res_fd < 0 ||
+       !vkr_context_import_resource_internal(ctx, res_id, alloc_size,
+                                             VIRGL_RESOURCE_FD_SHM, res_fd, mmap_ptr)) {
+      if (res_fd >= 0)
+         close(res_fd);
       munmap(mmap_ptr, alloc_size);
       close(fd);
       return false;
@@ -335,18 +345,34 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
    /* If memory might get exported, store a dup'ed fd in vkr_resource for:
     * - vkAllocateMemory for dma_buf import
     * - vkGetMemoryFdPropertiesKHR for dma_buf fd properties query
+    *
+    * A shm resource always carries a mapping in u.data (it is what every
+    * user of a shm resource expects) and its fd for vkAllocateMemory, which
+    * imports shm as host memory.
     */
    int res_fd = -1;
-   if (mem->might_export) {
+   void *mmap_ptr = NULL;
+   if (blob.type == VIRGL_RESOURCE_FD_SHM) {
+      mmap_ptr = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED, blob.u.fd, 0);
+      if (mmap_ptr == MAP_FAILED) {
+         close(blob.u.fd);
+         return false;
+      }
+   }
+   if (mem->might_export || mmap_ptr) {
       res_fd = os_dupfd_cloexec(blob.u.fd);
       if (res_fd < 0) {
+         if (mmap_ptr)
+            munmap(mmap_ptr, blob_size);
          close(blob.u.fd);
          return false;
       }
    }
 
    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size, blob.type, res_fd,
-                                             NULL)) {
+                                             mmap_ptr)) {
+      if (mmap_ptr)
+         munmap(mmap_ptr, blob_size);
       if (res_fd >= 0)
          close(res_fd);
       close(blob.u.fd);

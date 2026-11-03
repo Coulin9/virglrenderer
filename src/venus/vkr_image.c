@@ -36,6 +36,38 @@ vkr_image_fix_drm_format(struct vkr_device *dev,
 
    if (drm_format_info && drm_format_info->drmFormatModifier == DRM_FORMAT_MOD_LINEAR) {
       pCreateInfo->tiling = VK_IMAGE_TILING_LINEAR;
+
+      /* An imported linear buffer (a dma-buf from another device or process) comes
+       * with its own plane layout, but the host decides the layout of a linear
+       * image itself.  Refuse layouts it would not reproduce instead of reading the
+       * buffer with the wrong pitch.
+       */
+      struct vn_device_proc_table *vk = &dev->proc_table;
+      if (drm_format_info->drmFormatModifierPlaneCount != 1)
+         return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+      if (vk->GetDeviceImageSubresourceLayout) {
+         const VkSubresourceLayout *want = &drm_format_info->pPlaneLayouts[0];
+         const VkImageSubresource2 subres = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2,
+            .imageSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT },
+         };
+         const VkDeviceImageSubresourceInfo info = {
+            .sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO,
+            .pCreateInfo = pCreateInfo,
+            .pSubresource = &subres,
+         };
+         VkSubresourceLayout2 have = { .sType = VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2 };
+         vk->GetDeviceImageSubresourceLayout(dev->base.handle.device, &info, &have);
+         if (want->offset != have.subresourceLayout.offset ||
+             want->rowPitch != have.subresourceLayout.rowPitch) {
+            vkr_log("linear plane layout offset %" PRIu64 " pitch %" PRIu64
+                    " differs from the host's offset %" PRIu64 " pitch %" PRIu64,
+                    (uint64_t)want->offset, (uint64_t)want->rowPitch,
+                    (uint64_t)have.subresourceLayout.offset,
+                    (uint64_t)have.subresourceLayout.rowPitch);
+            return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+         }
+      }
       return VK_SUCCESS;
    }
 

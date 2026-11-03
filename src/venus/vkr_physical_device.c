@@ -158,11 +158,19 @@ vkr_physical_device_init_id_properties(struct vkr_physical_device *physical_dev)
 
    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
    physical_dev->id_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+   VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
+   };
+   if (physical_dev->EXT_external_memory_host)
+      physical_dev->id_properties.pNext = &host_props;
    VkPhysicalDeviceProperties2 props2 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
       .pNext = &physical_dev->id_properties
    };
    vk->GetPhysicalDeviceProperties2(handle, &props2);
+   physical_dev->id_properties.pNext = NULL;
+   physical_dev->min_imported_host_pointer_alignment =
+      host_props.minImportedHostPointerAlignment;
 }
 
 static void
@@ -395,19 +403,37 @@ vkr_physical_device_init_queue_family_properties(struct vkr_physical_device *phy
    physical_dev->queue_family_properties = props;
 }
 
+/* The only modifier emulated is DRM_FORMAT_MOD_LINEAR, and an image created with it is a
+ * host VK_IMAGE_TILING_LINEAR image (vkr_image_fix_drm_format), so it supports exactly the
+ * host's linear tiling features.  Report those: a compositor such as gamescope picks its
+ * scanout formats by the features of their modifiers (sampled, storage, transfer src).
+ */
 static void
-vkr_physical_device_emulate_drm_props(VkDrmFormatModifierPropertiesListEXT *drm_props_list)
+vkr_physical_device_emulate_drm_props(VkDrmFormatModifierPropertiesListEXT *drm_props_list,
+                                      VkFormatFeatureFlags linear_features)
 {
-    drm_props_list->drmFormatModifierCount = 1;
-    if (drm_props_list->pDrmFormatModifierProperties) {
+   drm_props_list->drmFormatModifierCount = linear_features ? 1 : 0;
+   if (linear_features && drm_props_list->pDrmFormatModifierProperties) {
       drm_props_list->pDrmFormatModifierProperties[0] = (VkDrmFormatModifierPropertiesEXT){
          .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
          .drmFormatModifierPlaneCount = 1,
-         .drmFormatModifierTilingFeatures = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-                                            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
-                                            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT,
+         .drmFormatModifierTilingFeatures = linear_features,
       };
-    };
+   }
+}
+
+static void
+vkr_physical_device_emulate_drm_props2(VkDrmFormatModifierPropertiesList2EXT *drm_props_list,
+                                       VkFormatFeatureFlags2 linear_features)
+{
+   drm_props_list->drmFormatModifierCount = linear_features ? 1 : 0;
+   if (linear_features && drm_props_list->pDrmFormatModifierProperties) {
+      drm_props_list->pDrmFormatModifierProperties[0] = (VkDrmFormatModifierProperties2EXT){
+         .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
+         .drmFormatModifierPlaneCount = 1,
+         .drmFormatModifierTilingFeatures = linear_features,
+      };
+   }
 }
 
 static void
@@ -771,10 +797,32 @@ vkr_dispatch_vkGetPhysicalDeviceFormatProperties2(
 
    /* emulate support for drm format modifiers */
    if (!physical_dev->EXT_image_drm_format_modifier) {
-      VkDrmFormatModifierPropertiesListEXT* drm_props_list =
-         vkr_find_struct(args->pFormatProperties, VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
+      VkDrmFormatModifierPropertiesListEXT *drm_props_list = vkr_find_struct(
+         args->pFormatProperties, VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
       if (drm_props_list) {
-         vkr_physical_device_emulate_drm_props(drm_props_list);
+         vkr_physical_device_emulate_drm_props(
+            drm_props_list, args->pFormatProperties->formatProperties.linearTilingFeatures);
+      }
+
+      VkDrmFormatModifierPropertiesList2EXT *drm_props_list2 = vkr_find_struct(
+         args->pFormatProperties, VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT);
+      if (drm_props_list2) {
+         /* the 64-bit features, from the guest's VkFormatProperties3 if it chained one */
+         VkFormatProperties3 local_props3 = {
+            .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3,
+         };
+         const VkFormatProperties3 *props3 =
+            vkr_find_struct(args->pFormatProperties, VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3);
+         if (!props3) {
+            VkFormatProperties2 local_props2 = {
+               .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+               .pNext = &local_props3,
+            };
+            vk->GetPhysicalDeviceFormatProperties2(args->physicalDevice, args->format,
+                                                   &local_props2);
+            props3 = &local_props3;
+         }
+         vkr_physical_device_emulate_drm_props2(drm_props_list2, props3->linearTilingFeatures);
       }
    }
 }
@@ -811,12 +859,11 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
          const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *drm_format_mod =
             (const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *)prev_struct->pNext;
          if (drm_format_mod->drmFormatModifier == DRM_FORMAT_MOD_LINEAR) {
-            /* Remove the struct from the list */
+            /* Remove the struct from the list: the image will be a host linear
+             * image, so the host's answer for linear tiling is the answer.
+             */
             prev_struct->pNext = drm_format_mod->pNext;
-            vkr_log("emulating DRM_FORMAT_MOD_LINEAR with VK_IMAGE_TILING_LINEAR");
             pImageFormatInfo->tiling = VK_IMAGE_TILING_LINEAR;
-            pImageFormatInfo->usage &=
-               ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
          } else {
             vkr_log("only DRM_FORMAT_MOD_LINEAR is supported");
             args->ret = VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -852,15 +899,6 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
                          VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
       if (img_props && args->ret == VK_SUCCESS)
          vkr_emulate_dma_buf_memory_properties(&img_props->externalMemoryProperties);
-   }
-
-   /* emulate support for drm format modifiers */
-   if (!physical_dev->EXT_image_drm_format_modifier) {
-      VkDrmFormatModifierPropertiesListEXT* drm_props_list =
-         vkr_find_struct(args->pImageFormatProperties, VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
-      if (drm_props_list) {
-         vkr_physical_device_emulate_drm_props(drm_props_list);
-      }
    }
 }
 
