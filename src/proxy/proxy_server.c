@@ -11,6 +11,7 @@
 
 #ifdef __APPLE__
 #include <crt_externs.h>
+#include <mach/machine.h>
 #include <spawn.h>
 #endif
 
@@ -73,6 +74,14 @@ proxy_server_spawn(const char *exec_path, char *const argv[], int remote_fd)
    posix_spawnattr_setflags(&attr,
                             POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETPGROUP);
    posix_spawnattr_setpgroup(&attr, 0);
+
+   /* Do not inherit a Rosetta launcher's architecture preference.  The
+    * server preloads the native Vulkan driver; only individual Neptune
+    * workers may need the x86_64 slice.  CPU_TYPE_ANY preserves thin builds. */
+   cpu_type_t cpu_pref[] = { CPU_TYPE_ARM64, CPU_TYPE_ANY };
+   cpu_subtype_t cpu_subpref[] = { CPU_SUBTYPE_ANY, CPU_SUBTYPE_ANY };
+   size_t ocount = 0;
+   posix_spawnattr_setarchpref_np(&attr, 2, cpu_pref, cpu_subpref, &ocount);
 
    posix_spawn_file_actions_t file_actions;
    if (posix_spawn_file_actions_init(&file_actions) != 0) {
