@@ -97,6 +97,8 @@ struct npt_d3d_library {
    /* Optional: names the guest program for the backend's per-application
     * profiles.  NULL => the backend sees virgl_render_server. */
    PFN_dxn_set_executable_path pfn_set_executable_path;
+   /* Optional D3DMetal diagnostics flush before unloading the backend. */
+   void (*pfn_hook_stats_flush)(void);
    enum npt_backend_kind backend;
 
    /* NPT_WA_* bits describing the workarounds the loaded backend needs, set in

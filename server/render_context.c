@@ -147,6 +147,7 @@ render_context_dispatch_submit_cmd(struct render_context *ctx,
 
       memcpy(cmd, req->cmd, inlined);
       if (!render_socket_receive_data(&ctx->socket, (char *)cmd + inlined, remain)) {
+         ctx->socket.peer_closed = false;
          free(cmd);
          return false;
       }
@@ -291,6 +292,8 @@ static const struct render_context_dispatch_entry
 static bool
 render_context_dispatch(struct render_context *ctx)
 {
+   ctx->socket.peer_closed = false;
+
    union render_context_op_request req;
    size_t req_size;
    int req_fds[8];
@@ -334,7 +337,7 @@ render_context_run(struct render_context *ctx)
 {
    while (true) {
       if (!render_context_dispatch(ctx))
-         return false;
+         return ctx->socket.peer_closed;
    }
 
    return true;

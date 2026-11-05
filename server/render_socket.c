@@ -70,6 +70,7 @@ render_socket_init(struct render_socket *socket, int fd)
    assert(fd >= 0);
    *socket = (struct render_socket){
       .fd = fd,
+      .peer_closed = false,
    };
 }
 
@@ -134,6 +135,8 @@ render_socket_recvmsg(struct render_socket *socket, struct msghdr *msg, size_t *
       }
       if (unlikely(s == 0)) {
          /* Peer closed the socket. */
+         if (state == SOCKET_STATE_FIRST_MSG)
+            socket->peer_closed = true;
          render_log("socket disconnected");
          return false;
       }
@@ -181,8 +184,10 @@ render_socket_recvmsg(struct render_socket *socket, struct msghdr *msg, size_t *
    do {
       const ssize_t s = recvmsg(socket->fd, msg, MSG_CMSG_CLOEXEC);
       if (unlikely(s <= 0)) {
-         if (!s)
+         if (!s) {
+            socket->peer_closed = true;
             return false;
+         }
 
          if (errno == EAGAIN || errno == EINTR)
             continue;

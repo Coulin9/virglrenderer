@@ -144,6 +144,13 @@ npt_library_load_embedder_api(struct npt_d3d_library *lib)
       if (!npt_library_check_abi(mod, prefix, "backend"))
          return false;
 
+      if (lib->backend == NPT_BACKEND_D3DMETAL) {
+         lib->pfn_hook_stats_flush =
+            ((union { void *p; void (*f)(void); }){
+               .p = dlsym(mod, "dmn_hook_stats_flush") }).f;
+         dlerror(); /* clear an absent optional symbol */
+      }
+
       lib->pfn_event_create =
          ((union { void *p; PFN_dxn_event_create f; }){
             .p = npt_library_embedder_sym(mod, prefix,
@@ -378,6 +385,9 @@ npt_library_init(struct npt_d3d_library *lib)
 void
 npt_library_fini(struct npt_d3d_library *lib)
 {
+   if (lib->pfn_hook_stats_flush)
+      lib->pfn_hook_stats_flush();
+
 #ifdef HAVE_DLFCN_H
    if (lib->d3d11_module)
       dlclose(lib->d3d11_module);

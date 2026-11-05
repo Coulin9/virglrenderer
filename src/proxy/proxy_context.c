@@ -629,13 +629,6 @@ proxy_context_destroy(struct virgl_context *base)
 {
    struct proxy_context *ctx = (struct proxy_context *)base;
 
-   /* ask the server process to terminate the context process */
-   if (!proxy_client_destroy_context(ctx->client, ctx->base.ctx_id))
-      proxy_log("failed to destroy ctx %d", ctx->base.ctx_id);
-
-   if (ctx->fence_socket_fd >= 0)
-      close(ctx->fence_socket_fd);
-
    if (ctx->sync_thread.fence_eventfd >= 0) {
       if (ctx->sync_thread.created) {
          ctx->sync_thread.stop = true;
@@ -647,6 +640,16 @@ proxy_context_destroy(struct virgl_context *base)
          close(ctx->sync_thread.fence_eventfd_write);
       close(ctx->sync_thread.fence_eventfd);
    }
+
+   if (ctx->fence_socket_fd >= 0) {
+      close(ctx->fence_socket_fd);
+      ctx->fence_socket_fd = -1;
+   }
+   proxy_socket_fini(&ctx->socket);
+
+   /* ask the server process to terminate the context process */
+   if (!proxy_client_destroy_context(ctx->client, ctx->base.ctx_id))
+      proxy_log("failed to destroy ctx %d", ctx->base.ctx_id);
 
    if (ctx->shmem.ptr)
       munmap(ctx->shmem.ptr, ctx->shmem.size);
@@ -670,8 +673,6 @@ proxy_context_destroy(struct virgl_context *base)
    mtx_destroy(&ctx->free_fences_mutex);
 
    proxy_context_resource_table_fini(ctx);
-
-   proxy_socket_fini(&ctx->socket);
 
    free(ctx);
 }

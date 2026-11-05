@@ -32,6 +32,7 @@
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #ifdef ENABLE_RENDER_SERVER_WORKER_THREAD
 #include "c11/threads.h"
 #endif
@@ -286,11 +287,8 @@ render_worker_jail_reap_any_worker(struct render_worker_jail *jail, bool block)
    /* A worker dying abnormally strands its guest context on dead rings
     * (the app spins forever); make such exits loud.
     *
-    * But destroying a context SIGKILLs its worker by design (see
-    * render_worker_destroy: "kill to make sure the worker exits in finite
-    * time"), and that is by far the common case -- tens of times per session.
-    * Reporting our own kill as a death made every teardown look like a crash
-    * and buried the real ones, so say nothing when we are the killer. */
+    * A worker killed by the finite-time teardown backstop is expected, so
+    * say nothing when we are the killer. */
    const bool killed_by_us = reaped && reaped->destroyed;
    if ((siginfo.si_code == CLD_KILLED && !killed_by_us) ||
        siginfo.si_code == CLD_DUMPED)
@@ -611,7 +609,36 @@ render_worker_destroy(struct render_worker_jail *jail, struct render_worker *wor
    thrd_join(worker->thread, NULL);
    worker->reaped = true;
 #else
-   /* kill to make sure the worker exits in finite time */
+   /* Allow socket EOF to trigger orderly teardown before the finite-time backstop. */
+   struct timespec deadline;
+   bool have_deadline = !clock_gettime(CLOCK_MONOTONIC, &deadline);
+   if (have_deadline) {
+      deadline.tv_nsec += 250000000;
+      if (deadline.tv_nsec >= 1000000000) {
+         deadline.tv_sec++;
+         deadline.tv_nsec -= 1000000000;
+      }
+   }
+   while (!worker->reaped && have_deadline) {
+      siginfo_t siginfo = { 0 };
+      if (!waitid(P_PID, (id_t)worker->pid, &siginfo, WEXITED | WNOHANG) &&
+          siginfo.si_pid == worker->pid) {
+         worker->reaped = true;
+         if (siginfo.si_code == CLD_KILLED || siginfo.si_code == CLD_DUMPED)
+            render_log("worker %d DIED on signal %d%s", worker->pid, siginfo.si_status,
+                       siginfo.si_code == CLD_DUMPED ? " (core dumped)" : "");
+         else if (siginfo.si_code == CLD_EXITED && siginfo.si_status != 0)
+            render_log("worker %d exited with status %d", worker->pid, siginfo.si_status);
+         break;
+      }
+      struct timespec now;
+      if (clock_gettime(CLOCK_MONOTONIC, &now) ||
+          now.tv_sec > deadline.tv_sec ||
+          (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+         break;
+      const struct timespec delay = { .tv_sec = 0, .tv_nsec = 2000000 };
+      nanosleep(&delay, NULL);
+   }
    if (!worker->reaped)
       kill(worker->pid, SIGKILL);
 #endif
