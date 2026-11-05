@@ -37,18 +37,24 @@
 /* D3D11_BIND_SHADER_RESOURCE (d3d11.h); consumers sample the texture. */
 #define NPT_D3D11_BIND_SHADER_RESOURCE 0x8u
 
-/* DXGI_FORMAT -> enum virgl_formats, for the 8-bit RGBA/BGRA families
- * that can back a presentable surface.  0 means "unmapped", which leaves
- * the importer's own format in charge. */
+/* DXGI_FORMAT -> raw storage-order virgl format for presentable surfaces.
+ * The exact DXGI format remains in the shared descriptor's metadata.
+ * 0 means "unmapped", leaving the importer's own format in charge. */
 static uint32_t
 npt_shared_dxgi_to_virgl_format(uint32_t dxgi_format)
 {
    switch (dxgi_format) {
    case 87: /* DXGI_FORMAT_B8G8R8A8_UNORM */
+   case 90: /* DXGI_FORMAT_B8G8R8A8_TYPELESS */
+   case 91: /* DXGI_FORMAT_B8G8R8A8_UNORM_SRGB */
       return VIRGL_FORMAT_B8G8R8A8_UNORM;
    case 88: /* DXGI_FORMAT_B8G8R8X8_UNORM */
+   case 92: /* DXGI_FORMAT_B8G8R8X8_TYPELESS */
+   case 93: /* DXGI_FORMAT_B8G8R8X8_UNORM_SRGB */
       return VIRGL_FORMAT_B8G8R8X8_UNORM;
    case 28: /* DXGI_FORMAT_R8G8B8A8_UNORM */
+   case 27: /* DXGI_FORMAT_R8G8B8A8_TYPELESS */
+   case 29: /* DXGI_FORMAT_R8G8B8A8_UNORM_SRGB */
       return VIRGL_FORMAT_R8G8B8A8_UNORM;
    default:
       return 0;
