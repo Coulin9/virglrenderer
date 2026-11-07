@@ -163,12 +163,18 @@ vkr_physical_device_init_id_properties(struct vkr_physical_device *physical_dev)
    };
    if (physical_dev->EXT_external_memory_host)
       physical_dev->id_properties.pNext = &host_props;
+   VkPhysicalDeviceDriverProperties driver_props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+      .pNext = physical_dev->id_properties.pNext,
+   };
+   physical_dev->id_properties.pNext = &driver_props;
    VkPhysicalDeviceProperties2 props2 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
       .pNext = &physical_dev->id_properties
    };
    vk->GetPhysicalDeviceProperties2(handle, &props2);
    physical_dev->id_properties.pNext = NULL;
+   physical_dev->driver_id = driver_props.driverID;
    physical_dev->min_imported_host_pointer_alignment =
       host_props.minImportedHostPointerAlignment;
 }
@@ -872,9 +878,8 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
       }
    }
 
-   /* The host knows nothing about dma_buf, and the memory it would be asked
-    * about is plain shm-backed memory with no Vulkan-level external handle.
-    * Ask about a non-external image and report the answer as dma_buf.
+   /* KK needs an explicit host-import marker to select interoperable backing.
+    * Other emulated renderers retain their non-external image path.
     */
    VkPhysicalDeviceExternalImageFormatInfo *ext_info = NULL;
    if (physical_dev->is_dma_buf_emulated) {
@@ -882,7 +887,10 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
                                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
       if (ext_info &&
           ext_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
-         ext_info->handleType = 0;
+         ext_info->handleType =
+            physical_dev->driver_id == VK_DRIVER_ID_MESA_KOSMICKRISP
+               ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT
+               : 0;
       else
          ext_info = NULL;
    }

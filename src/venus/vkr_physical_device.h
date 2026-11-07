@@ -35,6 +35,7 @@ struct vkr_physical_device {
 
    VkPhysicalDeviceMemoryProperties memory_properties;
    VkPhysicalDeviceIDProperties id_properties;
+   VkDriverId driver_id;
    bool is_dma_buf_fd_export_supported;
    bool is_opaque_fd_export_supported;
    bool is_dma_buf_emulated;

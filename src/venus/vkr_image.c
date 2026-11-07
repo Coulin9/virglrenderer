@@ -17,8 +17,12 @@ vkr_image_fix_create_info(struct vkr_device *dev, VkImageCreateInfo *pCreateInfo
 
    VkExternalMemoryImageCreateInfo *ext_create_info =
       vkr_find_struct(pCreateInfo, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
-   if (ext_create_info)
+   if (ext_create_info &&
+       (ext_create_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) {
       ext_create_info->handleTypes &= ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      if (dev->physical_device->driver_id == VK_DRIVER_ID_MESA_KOSMICKRISP)
+         ext_create_info->handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+   }
 }
 
 static VkResult
