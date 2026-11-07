@@ -30,6 +30,13 @@ static bool virgl_format_to_metal_format(uint32_t format, MTLPixelFormat *metal_
       { VIRGL_FORMAT_B8G8R8X8_UNORM, MTLPixelFormatBGRA8Unorm },
       { VIRGL_FORMAT_B8G8R8A8_SRGB, MTLPixelFormatBGRA8Unorm_sRGB },
       { VIRGL_FORMAT_B8G8R8X8_SRGB, MTLPixelFormatBGRA8Unorm_sRGB },
+      /* A/X8R8G8B8 and A/X8B8G8R8 name the same little-endian byte layouts
+       * as B8G8R8A8 and R8G8B8A8 above; mapping them keeps a scanout that
+       * uses the alternative virtio-gpu format on the native path. */
+      { VIRGL_FORMAT_A8R8G8B8_UNORM, MTLPixelFormatBGRA8Unorm },
+      { VIRGL_FORMAT_X8R8G8B8_UNORM, MTLPixelFormatBGRA8Unorm },
+      { VIRGL_FORMAT_A8B8G8R8_UNORM, MTLPixelFormatRGBA8Unorm },
+      { VIRGL_FORMAT_X8B8G8R8_UNORM, MTLPixelFormatRGBA8Unorm },
       { VIRGL_FORMAT_R16G16B16A16_FLOAT, MTLPixelFormatRGBA16Float },
       { VIRGL_FORMAT_R16G16B16X16_FLOAT, MTLPixelFormatRGBA16Float },
       { VIRGL_FORMAT_R16G16B16A16_UNORM, MTLPixelFormatRGBA16Unorm },
@@ -122,10 +129,21 @@ bool virgl_metal_create_texture(MTLDevice_id device,
    return false;
 }
 
+MTLDevice_id virgl_metal_default_device(void)
+{
+   /* +1 per the Create rule; kept for the process lifetime like the system
+    * device itself, so every scanout wrapper shares one MTLDevice. */
+   static id<MTLDevice> device;
+   if (!device)
+      device = [MTLCreateSystemDefaultDevice() retain];
+   return (MTLDevice_id)device;
+}
+
 bool virgl_metal_create_texture_from_shm(MTLDevice_id device,
                                          int fd,
                                          size_t size,
                                          const struct vrend_metal_texture_description *desc,
+                                         bool require_aligned_stride,
                                          MTLTexture_id *tex)
 {
    id<MTLDevice> mtl_device = (id<MTLDevice>)device;
@@ -140,7 +158,14 @@ bool virgl_metal_create_texture_from_shm(MTLDevice_id device,
    /* the backing MTLBuffer is shared system memory, so the texture must be too */
    descriptor.resourceOptions = MTLResourceStorageModeShared;
    deviceAlignment = [mtl_device minimumLinearTextureAlignmentForPixelFormat:descriptor.pixelFormat];
-   bytesPerRow = align(desc->stride, deviceAlignment);
+   bytesPerRow = desc->stride;
+   /* A scanout layout cannot be changed by the caller: rounding its stride up
+    * would move every row and corrupt the image, so refuse it instead. */
+   if (require_aligned_stride && bytesPerRow % deviceAlignment) {
+      [descriptor release];
+      return false;
+   }
+   bytesPerRow = align(bytesPerRow, deviceAlignment);
 
    /* newBufferWithBytesNoCopy requires a page-aligned pointer and length */
    const size_t page_size = getpagesize();

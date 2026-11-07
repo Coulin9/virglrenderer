@@ -112,6 +112,7 @@ bool virgl_egl_metal_create_texture(struct virgl_egl *egl, struct pipe_resource 
                                     uint32_t format, MTLTexture_id *tex);
 bool virgl_egl_metal_create_texture_from_shm(struct virgl_egl *egl, int fd, size_t size,
                                              const struct vrend_metal_texture_description *desc,
+                                             bool require_aligned_stride,
                                              MTLTexture_id *tex);
 EGLImageKHR virgl_egl_metal_image_from_texture(struct virgl_egl *egl, MTLTexture_id tex);
 #endif

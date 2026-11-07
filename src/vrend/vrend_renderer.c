@@ -14147,7 +14147,7 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
          MTLTexture_id texture;
 
          if (!virgl_egl_metal_create_texture_from_shm(egl, res->fd, res->map_size,
-                                                      &desc, &texture)) {
+                                                      &desc, false, &texture)) {
             FREE(gr);
             virgl_error("%s: failed to create texture from shared memory\n", __func__);
             return EINVAL;

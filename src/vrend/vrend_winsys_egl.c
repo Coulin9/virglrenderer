@@ -633,12 +633,14 @@ bool virgl_egl_metal_create_texture(struct virgl_egl *egl, struct pipe_resource 
 
 bool virgl_egl_metal_create_texture_from_shm(struct virgl_egl *egl, int fd, size_t size,
                                              const struct vrend_metal_texture_description *desc,
+                                             bool require_aligned_stride,
                                              MTLTexture_id *tex)
 {
    if (!egl || !egl->metal_device)
       return false;
 
-   return virgl_metal_create_texture_from_shm(egl->metal_device, fd, size, desc, tex);
+   return virgl_metal_create_texture_from_shm(egl->metal_device, fd, size, desc,
+                                              require_aligned_stride, tex);
 }
 
 EGLImageKHR

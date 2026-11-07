@@ -1561,15 +1561,18 @@ virgl_renderer_create_handle_for_scanout(uint32_t res_id,
       }
    }
 
-#ifdef HAVE_EPOXY_EGL_H
    /*
     * A cross-process resource (created by a Neptune or Venus context in
     * the render server) is backed by a mmap()-able shared-memory segment;
     * wrap the FD as an MTLBuffer and create a linear texture over it with
-    * the caller-provided layout.  Only the in-process (EGL/ANGLE) build
-    * displays scanouts; render-server builds have no EGL device.
+    * the caller-provided layout.
+    *
+    * The wrapping only needs a Metal device, not an EGL/ANGLE winsys: a
+    * render-server VMM initializes with NO_VIRGL and never creates one.
+    * Use the system default device (the same one the renderer and the
+    * display app sample with) so this works in both process layouts.
     */
-   if (res->fd_type == VIRGL_RESOURCE_FD_SHM) {
+   if (res->fd_type == VIRGL_RESOURCE_FD_SHM && res->fd >= 0 && res->map_size > 0) {
       /* For a cross-process blob the caller's format is a depth/bpp-derived
        * guess, so the exporter's own format wins where it is known.  A
        * scanout never passes through vrend_resource_needs_redblue_swizzle,
@@ -1584,14 +1587,14 @@ virgl_renderer_create_handle_for_scanout(uint32_t res_id,
       };
       MTLTexture_id tex;
 
-      if (virgl_egl_metal_create_texture_from_shm(egl, res->fd,
-                                                  res->map_size,
-                                                  &desc, &tex)) {
+      if (virgl_metal_create_texture_from_shm(virgl_metal_default_device(),
+                                              res->fd,
+                                              res->map_size,
+                                              &desc, true, &tex)) {
          *handle = tex;
          return VIRGL_NATIVE_HANDLE_METAL_TEXTURE;
       }
    }
-#endif /* HAVE_EPOXY_EGL_H */
 
    return VIRGL_NATIVE_HANDLE_NONE;
 #else /* !ENABLE_METAL */
