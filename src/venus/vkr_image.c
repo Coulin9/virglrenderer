@@ -6,6 +6,8 @@
 #include "vkr_image.h"
 
 #include "vkr_image_gen.h"
+#include "vkr_device_memory.h"
+#include "vkr_image_format.h"
 #include "vkr_physical_device.h"
 
 /* See vkr_buffer_fix_create_info. */
@@ -129,7 +131,9 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
     * situation because the app does not consider the memory external.
     */
 
-   vkr_image_create_and_add(dispatch->data, args);
+   struct vkr_image *image = vkr_image_create_and_add(dispatch->data, args);
+   if (image)
+      image->usage = args->pCreateInfo->usage;
 }
 
 static void
@@ -198,6 +202,10 @@ vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
 
+   struct vkr_image *image = vkr_image_from_handle(args->image);
+   struct vkr_device_memory *mem = vkr_device_memory_from_handle(args->memory);
+   image->import_format = mem ? mem->import_format : 0;
+
    vn_replace_vkBindImageMemory_args_handle(args);
    args->ret =
       vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
@@ -209,6 +217,13 @@ vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+
+   for (uint32_t i = 0; i < args->bindInfoCount; i++) {
+      const VkBindImageMemoryInfo *info = &args->pBindInfos[i];
+      struct vkr_image *image = vkr_image_from_handle(info->image);
+      struct vkr_device_memory *mem = vkr_device_memory_from_handle(info->memory);
+      image->import_format = mem ? mem->import_format : 0;
+   }
 
    vn_replace_vkBindImageMemory2_args_handle(args);
    args->ret = vk->BindImageMemory2(args->device, args->bindInfoCount, args->pBindInfos);
@@ -277,13 +292,52 @@ static void
 vkr_dispatch_vkCreateImageView(struct vn_dispatch_context *dispatch,
                                struct vn_command_vkCreateImageView *args)
 {
-   vkr_image_view_create_and_add(dispatch->data, args);
+   struct vkr_device *dev = vkr_device_from_handle(args->device);
+   struct vkr_image *image = vkr_image_from_handle(args->pCreateInfo->image);
+   const bool swap_rb = (image->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+      vkr_image_format_needs_rb_swap(image->import_format, args->pCreateInfo->format);
+   struct vkr_image_view *view = vkr_image_view_create_and_add(dispatch->data, args);
+   if (!view || !swap_rb)
+      return;
+
+   /* DRI3's visual can disagree with the producer's byte order. Correct only
+    * sampled reads; attachment and storage views must keep identity swizzles.
+    */
+   VkImageViewCreateInfo info = *args->pCreateInfo;
+   vkr_image_format_swap_rb(&info.components);
+   VkImageViewUsageCreateInfo usage = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+      .pNext = info.pNext,
+      .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+   };
+   VkImageViewUsageCreateInfo *existing =
+      vkr_find_struct(info.pNext, VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO);
+   VkImageUsageFlags saved_usage = 0;
+   if (existing) {
+      saved_usage = existing->usage;
+      existing->usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+   } else {
+      info.pNext = &usage;
+   }
+   struct vn_device_proc_table *vk = &dev->proc_table;
+   args->ret = vk->CreateImageView(args->device, &info, NULL, &view->sampled_view);
+   if (existing)
+      existing->usage = saved_usage;
+   if (args->ret != VK_SUCCESS) {
+      vk->DestroyImageView(args->device, view->base.handle.image_view, NULL);
+      vkr_device_remove_object(dispatch->data, dev, &view->base);
+   }
 }
 
 static void
 vkr_dispatch_vkDestroyImageView(struct vn_dispatch_context *dispatch,
                                 struct vn_command_vkDestroyImageView *args)
 {
+   struct vkr_image_view *view = vkr_image_view_from_handle(args->imageView);
+   if (view && view->sampled_view) {
+      struct vkr_device *dev = vkr_device_from_handle(args->device);
+      dev->proc_table.DestroyImageView(dev->base.handle.device, view->sampled_view, NULL);
+   }
    vkr_image_view_destroy_and_remove(dispatch->data, args);
 }
 

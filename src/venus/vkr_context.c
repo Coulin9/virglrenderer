@@ -239,6 +239,7 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
    res->res_id = res_id;
    res->fd_type = fd_type;
    res->size = blob_size;
+   res->export_format = 0;
 
    /* With mmap_ptr (shm), fd is the shm fd behind it or -1.  Ownership of fd
     * passes to the resource only on success.
@@ -379,6 +380,8 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
       return false;
    }
 
+   vkr_context_get_resource(ctx, res_id)->export_format = mem->import_format;
+   blob.export_format = mem->import_format;
    *out_blob = blob;
 
    return true;
@@ -407,12 +410,15 @@ vkr_context_import_resource(struct vkr_context *ctx,
                             uint32_t res_id,
                             enum virgl_resource_fd_type fd_type,
                             int fd,
-                            uint64_t size)
+                            uint64_t size,
+                            uint32_t export_format)
 {
-   if (fd_type == VIRGL_RESOURCE_FD_SHM)
-      return vkr_context_import_resource_from_shm(ctx, res_id, size, fd);
-
-   return vkr_context_import_resource_internal(ctx, res_id, size, fd_type, fd, NULL);
+   const bool ok = fd_type == VIRGL_RESOURCE_FD_SHM
+      ? vkr_context_import_resource_from_shm(ctx, res_id, size, fd)
+      : vkr_context_import_resource_internal(ctx, res_id, size, fd_type, fd, NULL);
+   if (ok)
+      vkr_context_get_resource(ctx, res_id)->export_format = export_format;
+   return ok;
 }
 
 void

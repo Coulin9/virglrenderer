@@ -388,6 +388,7 @@ vkr_device_memory_allocate(struct vn_dispatch_context *dispatch,
    VkExportMemoryAllocateInfo *export_info =
       vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
    uint32_t valid_fd_types = 0;
+   uint32_t import_format = 0;
    struct vkr_shm *shm = NULL;
    VkImportMemoryHostPointerInfoEXT local_host_import;
 
@@ -408,6 +409,7 @@ vkr_device_memory_allocate(struct vn_dispatch_context *dispatch,
          return;
       }
 
+      import_format = res->export_format;
       if (res->fd_type == VIRGL_RESOURCE_FD_SHM && physical_dev->is_dma_buf_emulated) {
          /* What the guest sees as a dma_buf is shm here (memory exported by
           * this or another context, or created by the VMM).  The driver
@@ -662,6 +664,7 @@ vkr_device_memory_allocate(struct vn_dispatch_context *dispatch,
    mem->might_export = might_export;
    mem->property_flags = property_flags;
    mem->valid_fd_types = valid_fd_types;
+   mem->import_format = import_format;
    mem->udmabuf_fd = udmabuf_fd;
    mem->gbm_bo = gbm_bo;
    mem->shm = shm;

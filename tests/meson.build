@@ -143,3 +143,10 @@ if with_neptune
       test(t[0], exe, env : neptune_test_env)
    endforeach
 endif
+
+if with_venus
+   test_venus_image_format = executable(
+      'test_venus_image_format', 'test_venus_image_format.c',
+      include_directories: include_directories('../src'))
+   test('test_venus_image_format', test_venus_image_format)
+endif

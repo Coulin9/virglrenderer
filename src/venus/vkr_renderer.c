@@ -221,12 +221,14 @@ vkr_renderer_import_resource(uint32_t ctx_id,
                              uint32_t res_id,
                              enum virgl_resource_fd_type fd_type,
                              int fd,
-                             uint64_t size)
+                             uint64_t size,
+                             uint32_t export_format)
 {
    TRACE_FUNC();
 
    assert(res_id);
-   assert(fd_type == VIRGL_RESOURCE_FD_DMABUF || fd_type == VIRGL_RESOURCE_FD_OPAQUE);
+   assert(fd_type == VIRGL_RESOURCE_FD_DMABUF || fd_type == VIRGL_RESOURCE_FD_OPAQUE ||
+          fd_type == VIRGL_RESOURCE_FD_SHM);
    assert(fd >= 0);
    assert(size);
 
@@ -234,7 +236,7 @@ vkr_renderer_import_resource(uint32_t ctx_id,
    if (!ctx)
       return false;
 
-   return vkr_context_import_resource(ctx, res_id, fd_type, fd, size);
+   return vkr_context_import_resource(ctx, res_id, fd_type, fd, size, export_format);
 }
 
 void

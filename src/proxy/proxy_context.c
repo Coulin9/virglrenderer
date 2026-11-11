@@ -614,6 +614,7 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
       .res_id = res_id,
       .fd_type = res_fd_type,
       .size = res_size,
+      .export_format = res->export_format,
    };
    if (!proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req), &res_fd, 1))
       proxy_log("failed to attach res %d", res_id);

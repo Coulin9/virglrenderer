@@ -10,11 +10,14 @@
 
 struct vkr_image {
    struct vkr_object base;
+   uint32_t import_format;
+   VkImageUsageFlags usage;
 };
 VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
 
 struct vkr_image_view {
    struct vkr_object base;
+   VkImageView sampled_view;
 };
 VKR_DEFINE_OBJECT_CAST(image_view, VK_OBJECT_TYPE_IMAGE_VIEW, VkImageView)
 

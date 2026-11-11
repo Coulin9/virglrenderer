@@ -41,6 +41,9 @@ VKR_DEFINE_OBJECT_CAST(descriptor_update_template,
                        VkDescriptorUpdateTemplate)
 
 void
+vkr_descriptor_set_replace_writes(uint32_t count, const VkWriteDescriptorSet *writes);
+
+void
 vkr_context_init_descriptor_set_layout_dispatch(struct vkr_context *ctx);
 
 void

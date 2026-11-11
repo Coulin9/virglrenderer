@@ -38,6 +38,7 @@ struct vkr_resource {
    int shm_fd;
 
    size_t size;
+   uint32_t export_format;
 };
 
 enum vkr_context_validate_level {
@@ -145,7 +146,8 @@ vkr_context_import_resource(struct vkr_context *ctx,
                             uint32_t res_id,
                             enum virgl_resource_fd_type fd_type,
                             int fd,
-                            uint64_t size);
+                            uint64_t size,
+                            uint32_t export_format);
 
 void
 vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id);

@@ -6,6 +6,7 @@
 #include "vkr_command_buffer.h"
 
 #include "vkr_command_buffer_gen.h"
+#include "vkr_descriptor_set.h"
 
 #ifdef __clang__
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
@@ -864,8 +865,13 @@ static void
 vkr_dispatch_vkCmdPushDescriptorSet(UNUSED struct vn_dispatch_context *dispatch,
                                     struct vn_command_vkCmdPushDescriptorSet *args)
 {
-   VKR_CMD_CALL(CmdPushDescriptorSet, args, args->pipelineBindPoint, args->layout,
-                args->set, args->descriptorWriteCount, args->pDescriptorWrites);
+   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+   vn_replace_VkCommandBuffer_handle(&args->commandBuffer);
+   vn_replace_VkPipelineLayout_handle(&args->layout);
+   vkr_descriptor_set_replace_writes(args->descriptorWriteCount, args->pDescriptorWrites);
+   cmd->device->proc_table.CmdPushDescriptorSet(args->commandBuffer, args->pipelineBindPoint,
+                                               args->layout, args->set,
+                                               args->descriptorWriteCount, args->pDescriptorWrites);
 }
 
 static void
@@ -1106,7 +1112,14 @@ static void
 vkr_dispatch_vkCmdPushDescriptorSet2(UNUSED struct vn_dispatch_context *dispatch,
                                      struct vn_command_vkCmdPushDescriptorSet2 *args)
 {
-   VKR_CMD_CALL(CmdPushDescriptorSet2, args, args->pPushDescriptorSetInfo);
+   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+   VkPushDescriptorSetInfo *info = (VkPushDescriptorSetInfo *)args->pPushDescriptorSetInfo;
+   const VkWriteDescriptorSet *writes = info->pDescriptorWrites;
+   info->pDescriptorWrites = NULL;
+   vn_replace_vkCmdPushDescriptorSet2_args_handle(args);
+   info->pDescriptorWrites = writes;
+   vkr_descriptor_set_replace_writes(info->descriptorWriteCount, writes);
+   cmd->device->proc_table.CmdPushDescriptorSet2(args->commandBuffer, info);
 }
 
 static void

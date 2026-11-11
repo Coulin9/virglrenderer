@@ -186,7 +186,7 @@ render_context_dispatch_import_resource(struct render_context *ctx,
    const struct render_context_op_import_resource_request *req =
       &request->import_resource;
    return render_state_import_resource(ctx->ctx_id, req->res_id, req->fd_type, fds[0],
-                                       req->size);
+                                       req->size, req->export_format);
 }
 
 static bool

@@ -174,6 +174,7 @@ struct render_context_op_import_resource_request {
    uint32_t res_id;
    enum virgl_resource_fd_type fd_type;
    uint64_t size;
+   uint32_t export_format;
    /* followed by 1 fd */
 };
 

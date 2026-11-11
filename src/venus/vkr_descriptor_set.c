@@ -6,6 +6,32 @@
 #include "vkr_descriptor_set.h"
 
 #include "vkr_descriptor_set_gen.h"
+#include "vkr_image.h"
+
+void
+vkr_descriptor_set_replace_writes(uint32_t count, const VkWriteDescriptorSet *writes)
+{
+   for (uint32_t i = 0; writes && i < count; i++) {
+      VkWriteDescriptorSet *write = (VkWriteDescriptorSet *)&writes[i];
+      if (write->descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
+          write->descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+         vn_replace_VkWriteDescriptorSet_handle(write);
+         continue;
+      }
+
+      VkDescriptorImageInfo *images = (VkDescriptorImageInfo *)write->pImageInfo;
+      write->pImageInfo = NULL;
+      vn_replace_VkWriteDescriptorSet_handle(write);
+      write->pImageInfo = images;
+      for (uint32_t j = 0; images && j < write->descriptorCount; j++) {
+         struct vkr_image_view *view = vkr_image_view_from_handle(images[j].imageView);
+         vn_replace_VkSampler_handle(&images[j].sampler);
+         images[j].imageView = view
+            ? (view->sampled_view ? view->sampled_view : view->base.handle.image_view)
+            : VK_NULL_HANDLE;
+      }
+   }
+}
 
 static void
 vkr_dispatch_vkGetDescriptorSetLayoutSupport(
@@ -139,7 +165,10 @@ vkr_dispatch_vkUpdateDescriptorSets(UNUSED struct vn_dispatch_context *dispatch,
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
 
-   vn_replace_vkUpdateDescriptorSets_args_handle(args);
+   vn_replace_VkDevice_handle(&args->device);
+   vkr_descriptor_set_replace_writes(args->descriptorWriteCount, args->pDescriptorWrites);
+   for (uint32_t i = 0; args->pDescriptorCopies && i < args->descriptorCopyCount; i++)
+      vn_replace_VkCopyDescriptorSet_handle((VkCopyDescriptorSet *)&args->pDescriptorCopies[i]);
    vk->UpdateDescriptorSets(args->device, args->descriptorWriteCount,
                             args->pDescriptorWrites, args->descriptorCopyCount,
                             args->pDescriptorCopies);

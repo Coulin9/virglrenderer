@@ -394,7 +394,8 @@ render_state_import_resource(uint32_t ctx_id,
                              uint32_t res_id,
                              enum virgl_resource_fd_type fd_type,
                              int fd,
-                             uint64_t size)
+                             uint64_t size,
+                             uint32_t export_format)
 {
    struct render_context *ctx = render_state_lookup_context(ctx_id);
    if (!ctx)
@@ -404,7 +405,7 @@ render_state_import_resource(uint32_t ctx_id,
    switch (ctx->backend) {
 #ifdef ENABLE_VENUS
    case RENDER_BACKEND_VENUS:
-      return vkr_renderer_import_resource(ctx_id, res_id, fd_type, fd, size);
+      return vkr_renderer_import_resource(ctx_id, res_id, fd_type, fd, size, export_format);
 #endif
 #ifdef ENABLE_NEPTUNE
    case RENDER_BACKEND_NEPTUNE:

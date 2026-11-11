@@ -40,6 +40,7 @@ struct vkr_device_memory {
 
    uint32_t property_flags;
    uint32_t valid_fd_types;
+   uint32_t import_format;
 
    /* gbm bo backing non-external mappable memory */
    struct gbm_bo *gbm_bo;
