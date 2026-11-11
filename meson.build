@@ -399,9 +399,9 @@ endif
 
 # The darwin neptune backend is dlopened, not linked: the render worker
 # runs the x86_64 slice (libd3dmetal-native, Apple D3DMetal under Rosetta)
-# or the arm64 slice (libdxmt-native, native D3D11-on-Metal) per NPT_BACKEND
+# or the arm64 slice (DXMT or Mullion) per NPT_BACKEND
 # (render_worker.c archpref), and npt_library.c dlopens the umbrella and
-# dlsyms both the D3D entry points and the dmn_*/dxmt_* embedder event API.
+# dlsyms the D3D entry points and the backend's embedder API.
 # So there is no backend build dependency and no per-backend build flag.
 
 if with_render_server != ''

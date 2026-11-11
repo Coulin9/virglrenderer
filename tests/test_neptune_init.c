@@ -111,6 +111,16 @@ test_neptune_get_capset(void)
    EXPECT((caps.caps_flags & backend_bits) == dxmt_bits);
    unsetenv("NPT_BACKEND");
 
+#ifdef __APPLE__
+   /* An unavailable Mullion library must never advertise D3D12 or DXIL. */
+   setenv("NPT_BACKEND", "mullion", 1);
+   setenv("NPT_D3D12_LIBRARY_PATH", "/nonexistent/libmullion-native.dylib", 1);
+   virgl_renderer_fill_caps(VIRTGPU_DRM_CAPSET_NEPTUNE, 0, &caps);
+   EXPECT(caps.caps_flags == 0);
+   unsetenv("NPT_D3D12_LIBRARY_PATH");
+   unsetenv("NPT_BACKEND");
+#endif
+
    /* NPT_CAPSET_CAPS overrides the whole word. */
    setenv("NPT_CAPSET_CAPS", "0x22", 1);
    virgl_renderer_fill_caps(VIRTGPU_DRM_CAPSET_NEPTUNE, 0, &caps);

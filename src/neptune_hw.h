@@ -31,9 +31,7 @@ struct virgl_renderer_capset_neptune {
 #define VIRGL_RENDERER_CAPSET_NEPTUNE_CAP_MAP_DEFAULT_BUFFERS         (1u << 4)
 #define VIRGL_RENDERER_CAPSET_NEPTUNE_CAP_SHADER_CACHE                (1u << 5)
 
-/* The D3D12 backend consumes DXIL containers directly (SM 6.x).  Set for
- * D3DMetal (Metal Shader Converter's native input is DXIL); clear for
- * DXMT, whose shader front end parses DXBC only. */
+/* The D3D12 backend consumes DXIL containers directly (SM 6.x). */
 #define VIRGL_RENDERER_CAPSET_NEPTUNE_CAP_DXIL                        (1u << 6)
 
 /* The D3D11 backend can take a guest shared-memory blob as the storage

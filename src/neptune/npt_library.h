@@ -39,6 +39,7 @@ enum npt_backend_kind {
    NPT_BACKEND_UNKNOWN = 0,
    NPT_BACKEND_D3DMETAL,   /* Apple D3DMetal via d3dmetal-native (dmn_*) */
    NPT_BACKEND_DXMT,       /* DXMT native D3D11-on-Metal (dxmt_*) */
+   NPT_BACKEND_MULLION,    /* Mullion native Direct3D-on-Metal (mullion_*) */
 };
 
 /* Real library-ABI signatures for the root-signature serializers.  The
@@ -76,10 +77,8 @@ struct npt_d3d_library {
 
    PFN_D3D12CreateDevice pfn_D3D12CreateDevice;
 
-   /* Darwin embedder event API, dlsym'd from the backend umbrella
-    * (d3dmetal exports dmn_event_*, dxmt exports dxmt_event_*).  NULL off
-    * darwin or when the backend did not load; npt_event.c signals through
-    * these. */
+   /* Darwin embedder event API, dlsym'd from the backend umbrella.
+    * NULL off darwin or when the backend did not load. */
    PFN_dxn_event_create pfn_event_create;
    PFN_dxn_event_close pfn_event_close;
    PFN_dxn_event_dup_fd pfn_event_dup_fd;

@@ -105,11 +105,8 @@ npt_library_check_abi(void *mod, const char *prefix, const char *what)
 }
 
 #ifdef __APPLE__
-/* Bind the backend's embedder API from the loaded umbrella.  d3dmetal
- * prefixes its exports dmn_, dxmt prefixes them dxmt_; probing each
- * prefix's native_abi_version (which every backend exports) identifies the
- * backend, which the workaround-flags gate below also needs.  False when
- * the backend's directx-native ABI does not match ours. */
+/* Bind the backend's embedder API from the loaded umbrella. Probing the
+ * native_abi_version exports identifies the backend for workaround flags. */
 static bool
 npt_library_load_embedder_api(struct npt_d3d_library *lib)
 {
@@ -125,6 +122,7 @@ npt_library_load_embedder_api(struct npt_d3d_library *lib)
    } candidates[] = {
       { "dmn_",  NPT_BACKEND_D3DMETAL },
       { "dxmt_", NPT_BACKEND_DXMT },
+      { "mullion_", NPT_BACKEND_MULLION },
    };
 
    for (size_t i = 0; i < ARRAY_SIZE(candidates); i++) {
@@ -189,8 +187,7 @@ npt_library_load_embedder_api(struct npt_d3d_library *lib)
                mod, prefix, DXN_SYM_SET_EXECUTABLE_PATH) }).f;
       return true;
    }
-   npt_log("backend embedder API (dmn_/dxmt_" DXN_SYM_NATIVE_ABI_VERSION
-           ") not found");
+   npt_log("backend embedder API not found");
    return true;
 }
 #endif /* __APPLE__ */
@@ -203,14 +200,20 @@ npt_library_init(struct npt_d3d_library *lib)
    memset(lib, 0, sizeof(*lib));
 
 #ifdef HAVE_DLFCN_H
+   const char *d3d11_default = NPT_D3D11_LIBRARY_DEFAULT;
+   const char *dxgi_default = NPT_DXGI_LIBRARY_DEFAULT;
+   const char *d3d12_default = NPT_D3D12_LIBRARY_DEFAULT;
+   const bool use_mullion = npt_mullion_selected();
+   if (use_mullion)
+      d3d11_default = dxgi_default = d3d12_default = NPT_MULLION_LIBRARY_NAME;
+
 #ifndef __APPLE__
    /* Headless operation requires the host D3D11/DXGI library's
     * headless WSI backend. */
    setenv("DXVK_WSI_DRIVER", "Headless", 0);
 #endif
 
-   lib->d3d11_module = npt_library_open("NPT_D3D11_LIBRARY_PATH",
-                                         NPT_D3D11_LIBRARY_DEFAULT);
+   lib->d3d11_module = npt_library_open(NPT_D3D11_LIBRARY_ENV, d3d11_default);
    if (lib->d3d11_module) {
       lib->pfn_D3D11CreateDevice =
          ((union { void *p; PFN_D3D11CreateDevice f; }){
@@ -251,8 +254,7 @@ npt_library_init(struct npt_d3d_library *lib)
       }
    }
 
-   lib->dxgi_module = npt_library_open("NPT_DXGI_LIBRARY_PATH",
-                                        NPT_DXGI_LIBRARY_DEFAULT);
+   lib->dxgi_module = npt_library_open(NPT_DXGI_LIBRARY_ENV, dxgi_default);
    if (lib->dxgi_module) {
       lib->pfn_CreateDXGIFactory1 =
          ((union { void *p; PFN_CreateDXGIFactory1 f; }){
@@ -271,7 +273,7 @@ npt_library_init(struct npt_d3d_library *lib)
     * pages the guest never writes.  require_host_import turns that into a
     * loud failure the guest answers by degrading to its sync-copy path.
     * Must be set before the module loads: the config parses once. */
-   {
+   if (!use_mullion) {
       const char *cfg = getenv("VKD3D_CONFIG");
       if (!cfg || !strstr(cfg, "require_host_import")) {
          if (cfg && cfg[0]) {
@@ -288,8 +290,7 @@ npt_library_init(struct npt_d3d_library *lib)
       }
    }
 
-   lib->d3d12_module = npt_library_open("NPT_D3D12_LIBRARY_PATH",
-                                         NPT_D3D12_LIBRARY_DEFAULT);
+   lib->d3d12_module = npt_library_open(NPT_D3D12_LIBRARY_ENV, d3d12_default);
    if (lib->d3d12_module) {
       lib->pfn_D3D12CreateDevice =
          ((union { void *p; PFN_D3D12CreateDevice f; }){
@@ -333,21 +334,19 @@ npt_library_init(struct npt_d3d_library *lib)
       }
    }
 
-   if (lib->d3d11_module) {
-      const char *p = getenv("NPT_D3D11_LIBRARY_PATH");
-      npt_log("loaded D3D11 library: %s", p ? p : NPT_D3D11_LIBRARY_DEFAULT);
-   }
-   if (lib->dxgi_module) {
-      const char *p = getenv("NPT_DXGI_LIBRARY_PATH");
-      npt_log("loaded DXGI library: %s", p ? p : NPT_DXGI_LIBRARY_DEFAULT);
-   }
-   if (lib->d3d12_module) {
-      const char *p = getenv("NPT_D3D12_LIBRARY_PATH");
-      npt_log("loaded D3D12 library: %s", p ? p : NPT_D3D12_LIBRARY_DEFAULT);
-   }
-
 #ifdef __APPLE__
    if (!npt_library_load_embedder_api(lib)) {
+      npt_library_fini(lib);
+      return false;
+   }
+
+   if (use_mullion &&
+       (lib->backend != NPT_BACKEND_MULLION || !lib->d3d12_module ||
+        lib->d3d11_module != lib->d3d12_module ||
+        lib->dxgi_module != lib->d3d12_module ||
+        !lib->pfn_event_create || !lib->pfn_event_close ||
+        !lib->pfn_event_dup_fd || !lib->pfn_shared_handle_close)) {
+      npt_log("Mullion requires one library with DXGI, D3D11, D3D12 and Neptune embedder exports");
       npt_library_fini(lib);
       return false;
    }
@@ -363,6 +362,19 @@ npt_library_init(struct npt_d3d_library *lib)
          NPT_WA_LINEARIZE_NOPERSPECTIVE_PS_INPUT |
          NPT_WA_SYNTHESIZE_IO_SIGNATURE_FROM_SHDR;
 #endif
+
+   if (lib->d3d11_module) {
+      const char *path = getenv(NPT_D3D11_LIBRARY_ENV);
+      npt_log("loaded D3D11 library: %s", path ? path : d3d11_default);
+   }
+   if (lib->dxgi_module) {
+      const char *path = getenv(NPT_DXGI_LIBRARY_ENV);
+      npt_log("loaded DXGI library: %s", path ? path : dxgi_default);
+   }
+   if (lib->d3d12_module) {
+      const char *path = getenv(NPT_D3D12_LIBRARY_ENV);
+      npt_log("loaded D3D12 library: %s", path ? path : d3d12_default);
+   }
 
    /* Debug/test override: NPT_WA_FLAGS forces the workaround-flags set (hex or
     * decimal), e.g. NPT_WA_FLAGS=0 disables every host workaround so the raw

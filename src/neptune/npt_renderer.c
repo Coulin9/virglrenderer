@@ -29,14 +29,10 @@ struct npt_renderer_state {
 
 static struct npt_renderer_state npt_state;
 
-/* Whether the D3D12 backend library exists and exports D3D12CreateDevice.
- *
- * Probed with a private dlopen rather than from npt_library state,
- * because the capset is reported before any context -- and so before
- * npt_library_init -- exists.  The dlopen refcount makes the later real
- * load cheap.  A split-arch proxy runs on a different arch than the
- * render server, so its local dlopen proves nothing and the answer has
- * to be overridden instead.
+/* Probe the backend before any context exists. Mullion shares the
+ * arm64 architecture of the capset caller and uses the worker's loader
+ * to check its ABI. A split-arch deployment supplies the answer using
+ * NPT_CAPSET_D3D12.
  */
 static bool
 npt_capset_probe_d3d12(void)
@@ -44,6 +40,15 @@ npt_capset_probe_d3d12(void)
    const long override = npt_capset_d3d12_override();
    if (override >= 0)
       return override != 0;
+
+   if (npt_mullion_selected()) {
+      struct npt_d3d_library library;
+      if (!npt_library_init(&library))
+         return false;
+      const bool ready = library.pfn_D3D12CreateDevice != NULL;
+      npt_library_fini(&library);
+      return ready;
+   }
 
 #ifdef HAVE_DLFCN_H
    const char *path = getenv(NPT_D3D12_LIBRARY_ENV);
@@ -113,16 +118,23 @@ npt_get_capset(void *capset, UNUSED uint32_t flags)
 {
    struct virgl_renderer_capset_neptune *c = capset;
    if (c) {
-      /* Probe once; the answer can't change while the process lives. */
-      static int d3d12_state; /* 0 = unprobed, 1 = no, 2 = yes */
-      if (!d3d12_state)
-         d3d12_state = npt_capset_probe_d3d12() ? 2 : 1;
+      /* Keep the Mullion probe independent of the legacy backend probe. */
+      const bool use_mullion = npt_mullion_selected();
+      static int d3d12_state, mullion_d3d12_state; /* 0 = unprobed, 1 = no, 2 = yes */
+      int *state = use_mullion ? &mullion_d3d12_state : &d3d12_state;
+      if (!*state)
+         *state = npt_capset_probe_d3d12() ? 2 : 1;
 
       memset(c, 0, sizeof(*c));
       c->wire_format_version = NPT_PROTOCOL_WIRE_VERSION;
-      if (d3d12_state == 2)
+      if (*state == 2)
          c->caps_flags |= VIRGL_RENDERER_CAPSET_NEPTUNE_CAP_D3D12;
-      c->caps_flags |= npt_capset_backend_caps();
+      if (use_mullion) {
+         if (*state == 2)
+            c->caps_flags |= VIRGL_RENDERER_CAPSET_NEPTUNE_CAP_DXIL;
+      } else {
+         c->caps_flags |= npt_capset_backend_caps();
+      }
 
       const long override = npt_capset_caps_override();
       if (override >= 0)
@@ -148,7 +160,8 @@ npt_renderer_init(UNUSED uint32_t flags, const struct npt_renderer_callbacks *cb
    if (cbs && cbs->debug_logger)
       virgl_log_set_handler(cbs->debug_logger, NULL, NULL);
 
-   npt_library_init(&npt_state.library);
+   if (!npt_library_init(&npt_state.library) && npt_mullion_selected())
+      return false;
 
    list_inithead(&npt_state.contexts);
 
