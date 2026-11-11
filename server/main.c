@@ -6,6 +6,52 @@
 #include "render_context.h"
 #include "render_server.h"
 
+#if defined(__APPLE__) && defined(__x86_64__)
+#include <mach/mach.h>
+#include <mach/task_policy.h>
+
+#include "virglrenderer.h"
+
+static void
+set_neptune_worker_latency(const struct render_context_args *args)
+{
+   if (!(args->init_flags & VIRGL_RENDERER_NEPTUNE))
+      return;
+
+   /* Apply the default latency policy in the D3DMetal worker before the
+    * renderer starts its threads.  Policy errors are logged and context
+    * startup continues with the kernel's current policy.
+    */
+   struct task_qos_policy policy = {
+      .task_latency_qos_tier = LATENCY_QOS_TIER_0,
+      .task_throughput_qos_tier = THROUGHPUT_QOS_TIER_UNSPECIFIED,
+   };
+   const kern_return_t ret = task_policy_set(
+      mach_task_self(), TASK_BASE_LATENCY_QOS_POLICY,
+      (task_policy_t)&policy, TASK_QOS_POLICY_COUNT);
+   if (ret != KERN_SUCCESS) {
+      render_log("Neptune worker %u: latency tier 0 failed: %s",
+                 args->ctx_id, mach_error_string(ret));
+      return;
+   }
+
+   mach_msg_type_number_t count = TASK_QOS_POLICY_COUNT;
+   boolean_t get_default = FALSE;
+   const kern_return_t query_ret = task_policy_get(
+      mach_task_self(), TASK_BASE_QOS_POLICY,
+      (task_policy_t)&policy, &count, &get_default);
+   if (query_ret != KERN_SUCCESS) {
+      render_log("Neptune worker %u: latency policy readback failed: %s",
+                 args->ctx_id, mach_error_string(query_ret));
+      return;
+   }
+
+   render_log("Neptune worker %u: latency tier 0 enabled, base=0x%x throughput=0x%x",
+              args->ctx_id, policy.task_latency_qos_tier,
+              policy.task_throughput_qos_tier);
+}
+#endif
+
 /* The main process is the server process.  It enters render_server_main and
  * never returns except on fatal errors.
  *
@@ -36,8 +82,12 @@ main(int argc, char **argv)
    bool ok = render_server_main(argc, argv, &ctx_args);
 
    /* this is a subprocess */
-   if (ok && ctx_args.valid)
+   if (ok && ctx_args.valid) {
+#if defined(__APPLE__) && defined(__x86_64__)
+      set_neptune_worker_latency(&ctx_args);
+#endif
       ok = render_context_main(&ctx_args);
+   }
 
    return ok ? 0 : -1;
 }
