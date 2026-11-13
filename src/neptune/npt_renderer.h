@@ -17,6 +17,7 @@
 #include "virglrenderer.h"
 
 struct npt_d3d_library;
+struct npt_work_context_config;
 
 #define NPT_RENDERER_THREAD_SYNC (1u << 0)
 #define NPT_RENDERER_ASYNC_FENCE_CB (1u << 1)
@@ -52,6 +53,10 @@ npt_renderer_create_context(uint32_t ctx_id,
 
 void
 npt_renderer_destroy_context(uint32_t ctx_id);
+
+void
+npt_renderer_set_work_context(uint32_t ctx_id,
+                              const struct npt_work_context_config *config);
 
 bool
 npt_renderer_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size);

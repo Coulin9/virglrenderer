@@ -12,6 +12,7 @@
 #include "npt_library.h"
 #include "npt_overrides.h"
 #include "npt_renderer.h"
+#include "npt_work_context.h"
 
 #include "neptune-protocol/npt_protocol_host_toplevel.h"
 
@@ -67,8 +68,18 @@ npt_override_CreateDXGIFactory2(UNUSED struct npt_dispatch_context *dctx,
 /* D3D11 device creation                                                */
 /* ================================================================== */
 
+static void
+npt_device_created(struct npt_dispatch_context *dctx)
+{
+   struct npt_context *ctx = npt_context_from_dispatch(dctx);
+   /* Task policy belongs to an authenticated standalone render worker, never
+    * a host using the library in-process or a shared worker thread. */
+   if (!ctx->on_worker_thread && ctx->work_context)
+      npt_work_context_device_created(ctx->work_context);
+}
+
 static HRESULT
-npt_override_D3D11CreateDevice(UNUSED struct npt_dispatch_context *dctx,
+npt_override_D3D11CreateDevice(struct npt_dispatch_context *dctx,
                                struct npt_command_D3D11CreateDevice *args)
 {
    struct npt_d3d_library *lib = npt_renderer_get_library();
@@ -90,11 +101,15 @@ npt_override_D3D11CreateDevice(UNUSED struct npt_dispatch_context *dctx,
       args->ppDevice,
       args->pFeatureLevel,
       args->ppImmediateContext);
+   if (NPT_SUCCEEDED(args->ret) &&
+       ((args->ppDevice && *args->ppDevice) ||
+        (args->ppImmediateContext && *args->ppImmediateContext)))
+      npt_device_created(dctx);
    return args->ret;
 }
 
 static HRESULT
-npt_override_D3D11On12CreateDevice(UNUSED struct npt_dispatch_context *dctx,
+npt_override_D3D11On12CreateDevice(struct npt_dispatch_context *dctx,
                                    struct npt_command_D3D11On12CreateDevice *args)
 {
    struct npt_d3d_library *lib = npt_renderer_get_library();
@@ -106,6 +121,10 @@ npt_override_D3D11On12CreateDevice(UNUSED struct npt_dispatch_context *dctx,
       args->pDevice, args->Flags, args->pFeatureLevels, args->FeatureLevels,
       args->ppCommandQueues, args->NumQueues, args->NodeMask,
       args->ppDevice, args->ppImmediateContext, args->pChosenFeatureLevel);
+   if (NPT_SUCCEEDED(args->ret) &&
+       ((args->ppDevice && *args->ppDevice) ||
+        (args->ppImmediateContext && *args->ppImmediateContext)))
+      npt_device_created(dctx);
    return args->ret;
 }
 
@@ -114,7 +133,7 @@ npt_override_D3D11On12CreateDevice(UNUSED struct npt_dispatch_context *dctx,
 /* ================================================================== */
 
 static HRESULT
-npt_override_D3D12CreateDevice(UNUSED struct npt_dispatch_context *dctx,
+npt_override_D3D12CreateDevice(struct npt_dispatch_context *dctx,
                                struct npt_command_D3D12CreateDevice *args)
 {
    struct npt_d3d_library *lib = npt_renderer_get_library();
@@ -126,6 +145,8 @@ npt_override_D3D12CreateDevice(UNUSED struct npt_dispatch_context *dctx,
                                            args->MinimumFeatureLevel,
                                            args->riid,
                                            args->ppDevice);
+   if (NPT_SUCCEEDED(args->ret) && args->ppDevice && *args->ppDevice)
+      npt_device_created(dctx);
    return args->ret;
 }
 

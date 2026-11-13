@@ -220,6 +220,8 @@ render_client_dispatch_create_context(struct render_client *client,
 
    const struct render_client_op_create_context_reply reply = {
       .ok = ok,
+      .worker_pid = ok ? render_worker_get_pid(
+         render_client_find_record(client, req->create_context.ctx_id)->worker) : 0,
    };
    if (!ok) {
       render_socket_send_reply(&client->socket, &reply, sizeof(reply));
@@ -245,6 +247,10 @@ static bool
 render_client_dispatch_init(struct render_client *client,
                             const union render_client_op_request *req)
 {
+   if (req->init.protocol_version != RENDER_PROTOCOL_VERSION) {
+      render_log("incompatible render protocol version %u", req->init.protocol_version);
+      return false;
+   }
    client->init_flags = req->init.flags;
 #ifdef ENABLE_VENUS
    if (client->init_flags & VIRGL_RENDERER_VENUS)

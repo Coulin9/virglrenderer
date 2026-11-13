@@ -10,6 +10,7 @@
 #include "proxy_client.h"
 #include "proxy_renderer.h"
 #include "proxy_server.h"
+#include "neptune/npt_work_context.h"
 
 #ifdef ENABLE_VENUS
 #include "vkr_renderer.h"
@@ -24,6 +25,7 @@ proxy_renderer_init(const struct proxy_renderer_cbs *cbs, uint32_t flags)
 {
    assert(flags & VIRGL_RENDERER_NO_VIRGL);
 
+   npt_work_context_status_reset();
    proxy_renderer.cbs = cbs;
    proxy_renderer.flags = flags;
 
@@ -53,6 +55,7 @@ proxy_renderer_fini(void)
       proxy_server_destroy(proxy_renderer.server);
 
    memset(&proxy_renderer, 0, sizeof(struct proxy_renderer));
+   npt_work_context_status_reset();
 }
 
 void

@@ -15,6 +15,9 @@
 
 #include "render_socket.h"
 #include "render_state.h"
+#ifdef ENABLE_NEPTUNE
+#include "npt_renderer.h"
+#endif
 
 void
 render_context_update_timeline(struct render_context *ctx,
@@ -237,6 +240,11 @@ render_context_dispatch_init(struct render_context *ctx,
       munmap(shmem_ptr, req->shmem_size);
       return false;
    }
+
+#ifdef ENABLE_NEPTUNE
+   if (ctx->backend == RENDER_BACKEND_NEPTUNE)
+      npt_renderer_set_work_context(ctx->ctx_id, &req->work_context);
+#endif
 
    ctx->shmem_fd = shmem_fd;
    ctx->shmem_size = req->shmem_size;

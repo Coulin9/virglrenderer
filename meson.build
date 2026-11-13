@@ -363,6 +363,9 @@ endif
 render_server_install_dir = get_option('prefix') / get_option('libexecdir')
 if metal_dep.found() and with_host_darwin
    add_languages('objc', required: true)
+   if with_neptune
+      add_languages('objcpp', required: true)
+   endif
    objcc = meson.get_compiler('objc')
    add_project_arguments(objcc.get_supported_arguments(warnings), language : 'objc')
    add_project_arguments(objcc.get_supported_arguments(flags), language : 'objc')
@@ -471,6 +474,10 @@ add_project_arguments('-DHAVE_CONFIG_H=1', language : 'c')
 if metal_dep.found() and with_host_darwin
    add_project_arguments('-imacros', meson.current_build_dir() / 'config.h', language : 'objc')
    add_project_arguments('-DHAVE_CONFIG_H=1', language : 'objc')
+   if with_neptune
+      add_project_arguments('-imacros', meson.current_build_dir() / 'config.h', language : 'objcpp')
+      add_project_arguments('-DHAVE_CONFIG_H=1', '-fvisibility=hidden', language : 'objcpp')
+   endif
 endif
 
 inc_configuration = include_directories(['.', 'src'])

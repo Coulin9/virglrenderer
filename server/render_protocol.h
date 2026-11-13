@@ -9,9 +9,13 @@
 #include <stdint.h>
 
 #include "virgl_resource.h"
+#include "neptune/npt_work_context.h"
 
 /* this covers the command line options and the socket type */
 #define RENDER_SERVER_VERSION 0
+
+/* Internal socket layouts, checked before any context is created. */
+#define RENDER_PROTOCOL_VERSION 1
 
 /* The protocol itself is internal to virglrenderer.  There is no backward
  * compatibility to be kept.
@@ -59,6 +63,7 @@ struct render_client_op_nop_request {
 struct render_client_op_init_request {
    struct render_client_op_header header;
    uint32_t flags; /* VIRGL_RENDERER_USE_* and others */
+   uint32_t protocol_version;
 };
 
 /* Remove all contexts.
@@ -87,6 +92,7 @@ struct render_client_op_create_context_request {
 
 struct render_client_op_create_context_reply {
    bool ok;
+   uint32_t worker_pid; /* actual spawned worker, for direct XPC peer validation */
    /* followed by 1 socket fd if ok */
 };
 
@@ -131,6 +137,7 @@ struct render_context_op_init_request {
    struct render_context_op_header header;
    uint32_t flags; /* VIRGL_RENDERER_CONTEXT_FLAG_*/
    size_t shmem_size;
+   struct npt_work_context_config work_context;
    /* followed by 1 shmem fd and optionally 1 eventfd */
 };
 

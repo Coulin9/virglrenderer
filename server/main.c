@@ -5,6 +5,7 @@
 
 #include "render_context.h"
 #include "render_server.h"
+#include "neptune/npt_work_context.h"
 
 #if defined(__APPLE__) && defined(__x86_64__)
 #include <mach/mach.h>
@@ -77,6 +78,11 @@ int
 main(int argc, char **argv)
 {
    render_log_init();
+
+#if defined(__APPLE__) && defined(ENABLE_NEPTUNE)
+   if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--work-context-service"))
+      return npt_work_context_service_main(argc == 3 ? argv[2] : "org.appledeck.render-context");
+#endif
 
    struct render_context_args ctx_args;
    bool ok = render_server_main(argc, argv, &ctx_args);

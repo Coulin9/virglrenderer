@@ -251,6 +251,9 @@ endif
 
 if with_neptune
    virgl_sources += neptune_sources
+   if with_host_darwin
+      virgl_sources += 'neptune/npt_work_context.mm'
+   endif
    if host_machine.system() == 'linux'
       virgl_sources += 'neptune/npt_hostmem.c'
    endif
@@ -306,7 +309,8 @@ libvirgl = static_library(
    virgl_sources,
    include_directories: [inc_gallium, inc_configuration, 'venus', 'drm', 'neptune'],
    dependencies : [virgl_depends, drm_uapi_dep],
-   objc_args : ['-fno-objc-arc'],
+   objc_args : ['-fno-objc-arc', '-fblocks'],
+   objcpp_args : ['-fno-objc-arc', '-fblocks', '-std=c++17'],
 )
 
 libvirgl_inc = [

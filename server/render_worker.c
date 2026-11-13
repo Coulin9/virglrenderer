@@ -644,6 +644,17 @@ render_worker_destroy(struct render_worker_jail *jail, struct render_worker *wor
       render_worker_jail_remove_worker(jail, worker);
 }
 
+uint32_t
+render_worker_get_pid(const struct render_worker *worker)
+{
+#ifdef ENABLE_RENDER_SERVER_WORKER_THREAD
+   (void)worker;
+   return 0; /* No independent XPC peer in thread-worker mode. */
+#else
+   return worker->pid > 0 ? (uint32_t)worker->pid : 0;
+#endif
+}
+
 bool
 render_worker_is_record(const struct render_worker *worker)
 {

@@ -98,6 +98,8 @@ struct npt_d3d_library {
    PFN_dxn_set_executable_path pfn_set_executable_path;
    /* Optional D3DMetal diagnostics flush before unloading the backend. */
    void (*pfn_hook_stats_flush)(void);
+   /* True only when the native asynchronous submission path carries IPC context. */
+   bool (*pfn_supports_xpc_work_context)(void);
    enum npt_backend_kind backend;
 
    /* NPT_WA_* bits describing the workarounds the loaded backend needs, set in

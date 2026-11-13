@@ -13,6 +13,8 @@
 #include "npt_event.h"
 #include "npt_feedback.h"
 #include "npt_overrides.h"
+#include "npt_ring.h"
+#include "npt_work_context.h"
 
 #include "neptune-protocol/npt_protocol_host_dispatch_types.h"
 #include "neptune-protocol/npt_protocol_host_id3d12commandqueue.h"
@@ -68,6 +70,39 @@ npt_override_ID3D12CommandQueue_Signal(
    return args->ret;
 }
 
+struct npt_execute_call {
+   struct npt_command_ID3D12CommandQueue_ExecuteCommandLists *args;
+   PFN_ID3D12CommandQueue_ExecuteCommandLists original;
+};
+
+static void
+npt_execute_original(void *argument)
+{
+   struct npt_execute_call *call = argument;
+   call->original(call->args->_self, call->args->NumCommandLists,
+                  call->args->ppCommandLists);
+}
+
+static void
+npt_override_ID3D12CommandQueue_ExecuteCommandLists(
+   struct npt_dispatch_context *dctx,
+   struct npt_command_ID3D12CommandQueue_ExecuteCommandLists *args,
+   PFN_ID3D12CommandQueue_ExecuteCommandLists original)
+{
+   struct npt_execute_call call = { args, original };
+   struct npt_ring *ring = npt_ring_current();
+   if (ring && &ring->dispatch != dctx)
+      ring = NULL;
+
+   struct npt_context *ctx = npt_context_from_dispatch(dctx);
+   /* The ring publishes head after each command, so it still names this
+    * ExecuteCommandLists while its decoded arguments are valid here. */
+   npt_work_context_execute(ctx->work_context, ring ? ring->id : 0,
+                            ring ? npt_ring_load_head(ring) : 0,
+                            args->_self, args->NumCommandLists,
+                            npt_execute_original, &call);
+}
+
 static HRESULT
 npt_override_ID3D12Fence_Signal(
    struct npt_dispatch_context *dctx,
@@ -85,6 +120,7 @@ npt_override_ID3D12Fence_Signal(
 
 struct npt_dispatch_id3d12commandqueue_overrides
 npt_id3d12commandqueue_overrides = {
+   .ExecuteCommandLists = npt_override_ID3D12CommandQueue_ExecuteCommandLists,
    .Signal = npt_override_ID3D12CommandQueue_Signal,
 };
 

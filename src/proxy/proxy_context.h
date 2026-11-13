@@ -7,6 +7,7 @@
 #define PROXY_CONTEXT_H
 
 #include "proxy_common.h"
+#include "neptune/npt_work_context.h"
 
 #include "c11/threads.h"
 #include "virgl_context.h"
@@ -31,6 +32,8 @@ struct proxy_context {
    struct proxy_socket socket;
 
    uint32_t capset_id;
+   void *work_context;
+   struct npt_work_context_config work_context_config;
 
    /* Out-of-band fence channel (RENDER_CONTEXT_OP_ATTACH_FENCE_SOCKET):
     * write end of a socketpair whose read end a dedicated server thread

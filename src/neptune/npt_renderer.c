@@ -16,6 +16,7 @@
 #include "neptune-protocol/npt_protocol_defs.h"
 #include "neptune_hw.h"
 #include "npt_context.h"
+#include "npt_work_context.h"
 #include "npt_library.h"
 #include "npt_profile.h"
 
@@ -261,6 +262,18 @@ npt_renderer_create_context(uint32_t ctx_id,
 
    list_addtail(&ctx->head, &npt_state.contexts);
    return true;
+}
+
+void
+npt_renderer_set_work_context(uint32_t ctx_id,
+                              const struct npt_work_context_config *config)
+{
+   struct npt_context *ctx = npt_renderer_lookup_context(ctx_id);
+   if (!ctx || ctx->work_context)
+      return;
+   bool supported = npt_state.library.pfn_supports_xpc_work_context &&
+                    npt_state.library.pfn_supports_xpc_work_context();
+   ctx->work_context = npt_work_context_worker_create(ctx_id, config, supported);
 }
 
 void

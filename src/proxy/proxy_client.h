@@ -27,7 +27,8 @@ proxy_client_create_context(struct proxy_client *client,
                             uint32_t capset_id,
                             size_t ctx_name_len,
                             const char *ctx_name,
-                            int *out_ctx_fd);
+                            int *out_ctx_fd,
+                            uint32_t *out_worker_pid);
 
 bool
 proxy_client_destroy_context(struct proxy_client *client, uint32_t ctx_id);

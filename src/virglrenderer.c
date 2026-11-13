@@ -22,6 +22,8 @@
  *
  **************************************************************************/
 
+#include "config.h"
+#include "neptune/npt_work_context.h"
 #include <stdio.h>
 #include <time.h>
 
@@ -1745,4 +1747,10 @@ int virgl_renderer_get_dev_fd(int ctx_id)
       return -ENODEV;
 
    return ctx->get_device_fd(ctx);
+}
+
+int
+virgl_renderer_get_work_context_status(void)
+{
+   return npt_work_context_status();
 }

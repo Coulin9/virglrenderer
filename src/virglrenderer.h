@@ -177,6 +177,11 @@ struct virgl_renderer_callbacks {
 VIRGL_EXPORT int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks *cb);
 VIRGL_EXPORT void virgl_renderer_poll(void); /* force fences */
 
+/* XPC attribution across active proxy rendering contexts: 0 pending or none,
+ * 1 all connected and capable, -1 at least one unavailable. Rendering continues
+ * in every state. Thread-safe; removed contexts no longer contribute. */
+VIRGL_EXPORT int virgl_renderer_get_work_context_status(void);
+
 /* we need to give qemu the cursor resource contents */
 VIRGL_EXPORT void *virgl_renderer_get_cursor_data(uint32_t resource_id, uint32_t *width, uint32_t *height);
 

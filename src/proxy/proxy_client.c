@@ -28,7 +28,8 @@ proxy_client_create_context(struct proxy_client *client,
                             uint32_t capset_id,
                             size_t ctx_name_len,
                             const char *ctx_name,
-                            int *out_ctx_fd)
+                            int *out_ctx_fd,
+                            uint32_t *out_worker_pid)
 {
    struct render_client_op_create_context_request req = {
       .header.op = RENDER_CLIENT_OP_CREATE_CONTEXT,
@@ -63,6 +64,7 @@ proxy_client_create_context(struct proxy_client *client,
    }
 
    *out_ctx_fd = ctx_fd;
+   *out_worker_pid = reply.worker_pid;
    return true;
 }
 
@@ -88,6 +90,7 @@ proxy_client_init(struct proxy_client *client, uint32_t flags)
    const struct render_client_op_init_request req = {
       .header.op = RENDER_CLIENT_OP_INIT,
       .flags = flags,
+      .protocol_version = RENDER_PROTOCOL_VERSION,
    };
    return proxy_socket_send_request(&client->socket, &req, sizeof(req));
 }

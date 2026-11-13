@@ -4,6 +4,7 @@
  */
 
 #include "npt_context.h"
+#include "npt_work_context.h"
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -1268,6 +1269,8 @@ npt_context_destroy(struct npt_context *ctx)
       npt_ring_stop(ring);
       npt_ring_destroy(ring);
    }
+   npt_work_context_worker_destroy(ctx->work_context);
+   ctx->work_context = NULL;
 
    for (uint32_t i = 0; i < ARRAY_SIZE(ctx->sync_queues); i++) {
       if (ctx->sync_queues[i]) {

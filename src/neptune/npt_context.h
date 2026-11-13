@@ -96,6 +96,8 @@ struct npt_context {
    /* True when this context runs on a virgl_render_server worker
     * thread; false in the default worker-process mode. */
    bool on_worker_thread;
+   /* VM-owned XPC session, applied only during actual rendering calls. */
+   void *work_context;
 
    npt_renderer_retire_fence_callback_type retire_fence;
 

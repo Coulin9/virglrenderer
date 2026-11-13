@@ -44,6 +44,9 @@ render_worker_create(struct render_worker_jail *jail,
 void
 render_worker_destroy(struct render_worker_jail *jail, struct render_worker *worker);
 
+uint32_t
+render_worker_get_pid(const struct render_worker *worker);
+
 bool
 render_worker_is_record(const struct render_worker *worker);
 

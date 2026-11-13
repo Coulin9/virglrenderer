@@ -147,6 +147,10 @@ npt_library_load_embedder_api(struct npt_d3d_library *lib)
             ((union { void *p; void (*f)(void); }){
                .p = dlsym(mod, "dmn_hook_stats_flush") }).f;
          dlerror(); /* clear an absent optional symbol */
+         lib->pfn_supports_xpc_work_context =
+            ((union { void *p; bool (*f)(void); }){
+               .p = dlsym(mod, "dmn_supports_xpc_work_context") }).f;
+         dlerror();
       }
 
       lib->pfn_event_create =

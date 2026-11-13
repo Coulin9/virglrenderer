@@ -20,6 +20,7 @@
 #include "virgl_fence.h"
 
 #include "proxy_client.h"
+#include "neptune/npt_work_context.h"
 
 struct proxy_fence {
    uint32_t flags;
@@ -629,6 +630,7 @@ static void
 proxy_context_destroy(struct virgl_context *base)
 {
    struct proxy_context *ctx = (struct proxy_context *)base;
+   npt_work_context_client_destroy(ctx->work_context);
 
    if (ctx->sync_thread.fence_eventfd >= 0) {
       if (ctx->sync_thread.created) {
@@ -795,6 +797,7 @@ proxy_context_init(struct proxy_context *ctx, uint32_t ctx_flags)
       .header.op = RENDER_CONTEXT_OP_INIT,
       .flags = ctx_flags,
       .shmem_size = ctx->shmem.size,
+      .work_context = ctx->work_context_config,
    };
    const int req_fds[2] = { ctx->shmem.fd, ctx->sync_thread.fence_eventfd_write };
    const int req_fd_count = req_fds[1] >= 0 ? 2 : 1;
@@ -819,8 +822,9 @@ proxy_context_create(uint32_t ctx_id,
    const uint32_t capset_id = ctx_flags & VIRGL_RENDERER_CONTEXT_FLAG_CAPSET_ID_MASK;
 
    int ctx_fd;
+   uint32_t worker_pid;
    if (!proxy_client_create_context(client, ctx_id, capset_id, debug_len, debug_name,
-                                    &ctx_fd)) {
+                                    &ctx_fd, &worker_pid)) {
       proxy_log("failed to create a context");
       return NULL;
    }
@@ -842,6 +846,10 @@ proxy_context_create(uint32_t ctx_id,
    list_inithead(&ctx->free_fences);
    ctx->sync_thread.fence_eventfd = -1;
    ctx->sync_thread.fence_eventfd_write = -1;
+
+   if (capset_id == VIRTGPU_DRM_CAPSET_NEPTUNE)
+      ctx->work_context = npt_work_context_client_create(ctx_id, worker_pid,
+                                                       &ctx->work_context_config);
 
    if (!proxy_context_init(ctx, ctx_flags)) {
       proxy_context_destroy(&ctx->base);
