@@ -182,6 +182,17 @@ VIRGL_EXPORT void virgl_renderer_poll(void); /* force fences */
  * in every state. Thread-safe; removed contexts no longer contribute. */
 VIRGL_EXPORT int virgl_renderer_get_work_context_status(void);
 
+/* Publish VM activity to authenticated rendering workers. Each true call
+ * requests a role check; false stops maintenance without restoring a role.
+ * Asynchronous and thread-safe; the latest value also applies to new workers. */
+VIRGL_EXPORT void virgl_renderer_set_work_context_active(bool active);
+
+/* Off-main-thread startup probe: 1 for a current-protocol broker pong, else 0.
+ * Bounds the reply wait by timeout_ms, then drains local XPC cancellation.
+ * No callbacks remain executing on return; no rendering session is created. */
+VIRGL_EXPORT int virgl_renderer_probe_work_context_service(const char *service,
+                                                          uint32_t timeout_ms);
+
 /* we need to give qemu the cursor resource contents */
 VIRGL_EXPORT void *virgl_renderer_get_cursor_data(uint32_t resource_id, uint32_t *width, uint32_t *height);
 

@@ -18,9 +18,57 @@
 
 #define SETUP_TIMEOUT_NS (5ull * NSEC_PER_SEC)
 #define MAX_BROKER_PEERS 128
+#define WORK_CONTEXT_SERVICE_PROTOCOL 1
+
+struct service_probe {
+   dispatch_semaphore_t replied = dispatch_semaphore_create(0);
+   dispatch_semaphore_t closed = dispatch_semaphore_create(0);
+   int result = 0;
+   ~service_probe() { dispatch_release(replied); dispatch_release(closed); }
+};
+
+int npt_work_context_probe_service(const char *service, uint32_t timeout_ms)
+{
+   if (!service || !*service || !timeout_ms) return 0;
+   dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeout_ms * NSEC_PER_MSEC);
+   service_probe state;
+   service_probe *probe = &state;
+   dispatch_queue_t queue = dispatch_queue_create("org.appledeck.render-context.probe", DISPATCH_QUEUE_SERIAL);
+   xpc_connection_t connection = xpc_connection_create_mach_service(service, queue, 0);
+   if (!connection) { dispatch_release(queue); return 0; }
+   xpc_connection_set_event_handler(connection, ^(xpc_object_t event) {
+      if (event == XPC_ERROR_CONNECTION_INVALID) dispatch_semaphore_signal(probe->closed);
+   });
+   xpc_connection_resume(connection);
+   xpc_object_t message = xpc_dictionary_create(NULL, NULL, 0);
+   xpc_dictionary_set_string(message, "op", "ping");
+   xpc_dictionary_set_uint64(message, "version", WORK_CONTEXT_SERVICE_PROTOCOL);
+   xpc_connection_send_message_with_reply(connection, message, queue, ^(xpc_object_t reply) {
+      if (xpc_get_type(reply) == XPC_TYPE_DICTIONARY) {
+         const char *operation = xpc_dictionary_get_string(reply, "op");
+         probe->result = operation && !strcmp(operation, "pong") &&
+            xpc_dictionary_get_uint64(reply, "version") == WORK_CONTEXT_SERVICE_PROTOCOL;
+      }
+      dispatch_semaphore_signal(probe->replied);
+   });
+   xpc_release(message);
+   bool replied = dispatch_semaphore_wait(probe->replied, deadline) == 0;
+   xpc_connection_cancel(connection);
+   /* Cancellation locally completes an outstanding reply and delivers a final
+    * INVALID event, independent of the broker. Drain both callback bodies on
+    * this private serial queue before returning or permitting a dlclose. */
+   if (!replied) dispatch_semaphore_wait(probe->replied, DISPATCH_TIME_FOREVER);
+   dispatch_semaphore_wait(probe->closed, DISPATCH_TIME_FOREVER);
+   dispatch_sync(queue, ^{});
+   xpc_release(connection);
+   dispatch_release(queue);
+   return replied ? probe->result : 0;
+}
 
 static pthread_mutex_t status_mutex = PTHREAD_MUTEX_INITIALIZER;
 static unsigned status_pending, status_active, status_failed, status_generation;
+static bool render_active;
+static NSMutableSet *clients;
 
 int npt_work_context_status(void)
 {
@@ -94,14 +142,14 @@ static void invoke_current_call(void)
    pthread_mutex_t mutex;
    dispatch_block_t carrier;
    uint64_t sequence;
-   bool closing, tracked, trace, device_ready, role_attempted;
+   bool closing, tracked, trace, device_ready, active;
    unsigned generation;
    int state;
 }
 - (void)setState:(int)value;
 - (void)fail:(const char *)reason;
 - (void)closeConnections;
-- (void)applyDeviceRole;
+- (void)reconcileDeviceRole;
 @end
 
 static void cancel_connection(xpc_connection_t *connection)
@@ -133,23 +181,32 @@ static void cancel_connection(xpc_connection_t *connection)
    state = value;
    pthread_mutex_unlock(&status_mutex);
 }
-- (void)applyDeviceRole
+- (void)reconcileDeviceRole
 {
-   /* Native device initialization can change the task's role. Wait for both
-    * that initialization and authenticated VM ownership, in either order.
-    * This queue owns the latch; later policy changes never cause a retry. */
-   if (closing || state != 1 || !device_ready || role_attempted) return;
-   role_attempted = true;
-   task_category_policy_data_t policy = { TASK_FOREGROUND_APPLICATION };
-   kern_return_t kr = task_policy_set(mach_task_self(), TASK_CATEGORY_POLICY,
-                                      (task_policy_t)&policy, TASK_CATEGORY_POLICY_COUNT);
+   /* Device initialization and system policy can change the task's role. Only
+    * explicit VM activity requests maintain it; no worker timer or RPC does. */
+   if (closing || state != 1 || !device_ready || !active) return;
    task_category_policy_data_t actual = { TASK_UNSPECIFIED };
    mach_msg_type_number_t count = TASK_CATEGORY_POLICY_COUNT;
    boolean_t get_default = FALSE;
    kern_return_t read_kr = task_policy_get(mach_task_self(), TASK_CATEGORY_POLICY,
                                           (task_policy_t)&actual, &count, &get_default);
-   fprintf(stderr, "AppleDeck work-context device-role: pid=%d ctx=%u set=%d get=%d role=%d count=%u default=%d\n",
-           getpid(), context_id, kr, read_kr, actual.role, count, get_default);
+   if (read_kr != KERN_SUCCESS || count != TASK_CATEGORY_POLICY_COUNT || get_default) {
+      fprintf(stderr, "AppleDeck work-context device-role-read: pid=%d ctx=%u get=%d count=%u default=%d\n",
+              getpid(), context_id, read_kr, count, get_default);
+      return;
+   }
+   if (actual.role == TASK_FOREGROUND_APPLICATION) return;
+   task_role_t before = actual.role;
+   task_category_policy_data_t policy = { TASK_FOREGROUND_APPLICATION };
+   kern_return_t kr = task_policy_set(mach_task_self(), TASK_CATEGORY_POLICY,
+                                      (task_policy_t)&policy, TASK_CATEGORY_POLICY_COUNT);
+   count = TASK_CATEGORY_POLICY_COUNT;
+   get_default = FALSE;
+   read_kr = task_policy_get(mach_task_self(), TASK_CATEGORY_POLICY,
+                             (task_policy_t)&actual, &count, &get_default);
+   fprintf(stderr, "AppleDeck work-context device-role: pid=%d ctx=%u before=%d set=%d get=%d role=%d count=%u default=%d\n",
+           getpid(), context_id, before, kr, read_kr, actual.role, count, get_default);
    /* A policy failure must not disable IPC attribution or rendering. */
 }
 - (void)closeConnections
@@ -206,6 +263,34 @@ static xpc_object_t session_message(NptWorkContext *context, const char *operati
    return message;
 }
 
+static void send_current_activity(NptWorkContext *client)
+{
+   /* This runs on the client's queue. Read the value here, not when its work
+    * was queued, so an old request cannot overwrite a newer inactive state. */
+   if (client->closing || client->state != 1 || !client->peer) return;
+   pthread_mutex_lock(&status_mutex);
+   bool active = render_active;
+   pthread_mutex_unlock(&status_mutex);
+   xpc_object_t message = session_message(client, "activity");
+   xpc_dictionary_set_bool(message, "active", active);
+   xpc_connection_send_message(client->peer, message);
+   xpc_release(message);
+}
+
+void npt_work_context_set_active(bool active)
+{
+   pthread_mutex_lock(&status_mutex);
+   bool send = active || active != render_active;
+   render_active = active;
+   NSSet *snapshot = send ? [clients copy] : nil;
+   pthread_mutex_unlock(&status_mutex);
+   /* The snapshot and queued blocks retain each client across concurrent
+    * destroy. No queue work or synchronous dispatch runs under status_mutex. */
+   for (NptWorkContext *client in snapshot)
+      dispatch_async(client->queue, ^{ send_current_activity(client); });
+   [snapshot release];
+}
+
 static void setup_timeout(NptWorkContext *context)
 {
    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, SETUP_TIMEOUT_NS), context->queue, ^{
@@ -233,6 +318,7 @@ static void client_connect(NptWorkContext *client, xpc_endpoint_t endpoint)
          return;
       }
       [client setState:1];
+      send_current_activity(client);
       fprintf(stderr, "AppleDeck work-context ready: vm=%u worker=%u ctx=%u\n",
               client->config.owner_pid, client->worker_pid, client->context_id);
    });
@@ -263,6 +349,8 @@ void *npt_work_context_client_create(uint32_t context_id, uint32_t worker_pid,
    client->tracked = true;
    client->generation = status_generation;
    ++status_pending;
+   if (!clients) clients = [[NSMutableSet alloc] init];
+   [clients addObject:client];
    pthread_mutex_unlock(&status_mutex);
    /* Start asynchronously: unavailable attribution must not prevent rendering. */
    char *service_copy = strdup(service);
@@ -309,6 +397,9 @@ void *npt_work_context_client_create(uint32_t context_id, uint32_t worker_pid,
 static void context_destroy(NptWorkContext *context)
 {
    if (!context) return;
+   pthread_mutex_lock(&status_mutex);
+   [clients removeObject:context];
+   pthread_mutex_unlock(&status_mutex);
    dispatch_sync(context->queue, ^{
       context->closing = true;
       [context closeConnections];
@@ -366,9 +457,19 @@ void *npt_work_context_worker_create(uint32_t context_id,
                return;
             }
             const char *operation = xpc_dictionary_get_string(message, "op");
-            if (!operation || strcmp(operation, "render-context") ||
-                !matching_session(message, worker) || worker->unfinished_reply || !supported) {
+            if (!operation || !matching_session(message, worker) || !supported) {
                [worker fail:"render-context request rejected"];
+               return;
+            }
+            xpc_object_t active_value = xpc_dictionary_get_value(message, "active");
+            if (!strcmp(operation, "activity") && worker->state == 1 && active_value &&
+                xpc_get_type(active_value) == XPC_TYPE_BOOL) {
+               worker->active = xpc_dictionary_get_bool(message, "active");
+               [worker reconcileDeviceRole];
+               return;
+            }
+            if (strcmp(operation, "render-context") || worker->unfinished_reply) {
+               [worker fail:"render-context operation rejected"];
                return;
             }
             worker->unfinished_reply = xpc_dictionary_create_reply(message);
@@ -390,7 +491,6 @@ void *npt_work_context_worker_create(uint32_t context_id,
             worker->carrier = captured;
             pthread_mutex_unlock(&worker->mutex);
             [worker setState:1];
-            [worker applyDeviceRole];
             xpc_object_t ready = session_message(worker, "ready");
             xpc_dictionary_set_bool(ready, "supported", true);
             xpc_connection_send_message(worker->peer, ready);
@@ -437,11 +537,11 @@ void npt_work_context_device_created(void *opaque)
    NptWorkContext *worker = (NptWorkContext *)opaque;
    if (!worker) return;
    /* Called from a rendering thread, never this queue. The context owner joins
-    * rendering threads before destroy. If already authenticated, finish the
-    * one policy request before returning the newly created device to the guest. */
+    * rendering threads before destroy. Reconcile after native initialization
+    * if the authenticated VM has already requested active maintenance. */
    dispatch_sync(worker->queue, ^{
       worker->device_ready = true;
-      [worker applyDeviceRole];
+      [worker reconcileDeviceRole];
    });
 }
 
@@ -561,7 +661,22 @@ int npt_work_context_service_main(const char *service)
          xpc_connection_set_event_handler(connection, ^(xpc_object_t message) {
             @autoreleasepool {
                if (peer->closed) return;
-               if (xpc_get_type(message) != XPC_TYPE_DICTIONARY || peer->nonce || !broker_parse(peer, message)) {
+               if (xpc_get_type(message) != XPC_TYPE_DICTIONARY || peer->nonce) {
+                  broker_remove(peer, pending, peers);
+                  return;
+               }
+               const char *operation = xpc_dictionary_get_string(message, "op");
+               if (operation && !strcmp(operation, "ping") &&
+                   xpc_dictionary_get_uint64(message, "version") == WORK_CONTEXT_SERVICE_PROTOCOL) {
+                  xpc_object_t reply = xpc_dictionary_create_reply(message);
+                  if (!reply) { broker_remove(peer, pending, peers); return; }
+                  xpc_dictionary_set_string(reply, "op", "pong");
+                  xpc_dictionary_set_uint64(reply, "version", WORK_CONTEXT_SERVICE_PROTOCOL);
+                  xpc_connection_send_message(peer->connection, reply);
+                  xpc_release(reply);
+                  return; // No nonce, endpoint, or rendering session is created.
+               }
+               if (!broker_parse(peer, message)) {
                   broker_remove(peer, pending, peers);
                   return;
                }

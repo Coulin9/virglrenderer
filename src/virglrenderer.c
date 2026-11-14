@@ -1754,3 +1754,15 @@ virgl_renderer_get_work_context_status(void)
 {
    return npt_work_context_status();
 }
+
+void
+virgl_renderer_set_work_context_active(bool active)
+{
+   npt_work_context_set_active(active);
+}
+
+int
+virgl_renderer_probe_work_context_service(const char *service, uint32_t timeout_ms)
+{
+   return npt_work_context_probe_service(service, timeout_ms);
+}

@@ -21,6 +21,8 @@ void *npt_work_context_client_create(uint32_t context_id, uint32_t worker_pid,
 void npt_work_context_client_destroy(void *client);
 int npt_work_context_status(void);
 void npt_work_context_status_reset(void);
+void npt_work_context_set_active(bool active);
+int npt_work_context_probe_service(const char *service, uint32_t timeout_ms);
 void *npt_work_context_worker_create(uint32_t context_id,
                                     const struct npt_work_context_config *config,
                                     bool supported);
@@ -38,6 +40,9 @@ static inline void *npt_work_context_client_create(uint32_t id, uint32_t pid,
 static inline void npt_work_context_client_destroy(void *p) { (void)p; }
 static inline int npt_work_context_status(void) { return 0; }
 static inline void npt_work_context_status_reset(void) {}
+static inline void npt_work_context_set_active(bool active) { (void)active; }
+static inline int npt_work_context_probe_service(const char *service, uint32_t timeout_ms)
+{ (void)service; (void)timeout_ms; return 0; }
 static inline void *npt_work_context_worker_create(uint32_t id,
    const struct npt_work_context_config *cfg, bool supported)
 { (void)id; (void)cfg; (void)supported; return 0; }

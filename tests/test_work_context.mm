@@ -12,11 +12,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <atomic>
+#include <chrono>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -116,18 +118,10 @@ static task_role_t task_role(void)
    return policy.role;
 }
 
-static void verify_role_once(void *worker)
+static void wait_role(task_role_t expected)
 {
-   assert(task_role() == TASK_FOREGROUND_APPLICATION);
-   /* Simulate a later policy owner changing this isolated test worker. A
-    * repeated device notification must not fight it by applying role 1 again. */
-   task_category_policy_data_t policy = { TASK_BACKGROUND_APPLICATION };
-   assert(task_policy_set(mach_task_self(), TASK_CATEGORY_POLICY,
-                          (task_policy_t)&policy, TASK_CATEGORY_POLICY_COUNT) == KERN_SUCCESS);
-   assert(task_role() == TASK_BACKGROUND_APPLICATION);
-   npt_work_context_device_created(worker);
-   npt_work_context_device_created(worker);
-   assert(task_role() == TASK_BACKGROUND_APPLICATION);
+   for (unsigned i = 0; i < 500 && task_role() != expected; ++i) usleep(10000);
+   assert(task_role() == expected);
 }
 
 static int worker_main(int fd, bool supported)
@@ -146,9 +140,17 @@ static int worker_main(int fd, bool supported)
       } else if (command == 'a') {
          assert(task_role() == initial_role); // Ready alone must not apply policy.
          npt_work_context_device_created(worker);
-         verify_role_once(worker);
       } else if (command == 'v') {
-         verify_role_once(worker); // The earlier device event was held until ready.
+         wait_role(TASK_FOREGROUND_APPLICATION);
+      } else if (command == 'b') {
+         task_category_policy_data_t policy = { TASK_BACKGROUND_APPLICATION };
+         assert(task_policy_set(mach_task_self(), TASK_CATEGORY_POLICY,
+                                (task_policy_t)&policy, TASK_CATEGORY_POLICY_COUNT) == KERN_SUCCESS);
+      } else if (command == 'i') {
+         npt_work_context_device_created(worker);
+         npt_work_context_device_created(worker);
+         usleep(200000);
+         assert(task_role() == TASK_BACKGROUND_APPLICATION);
       } else {
          if (command == 'f') usleep(200000); // Allow asynchronous peer cancellation.
          run_calls(worker, static_cast<pid_t>(config.owner_pid), command == 'r');
@@ -207,6 +209,30 @@ static void command(session &s, char value)
    assert(value == reply);
 }
 
+static void check_maintenance(session &s)
+{
+   command(s, 'v');
+   for (unsigned i = 0; i < 3; ++i) npt_work_context_set_active(true);
+   command(s, 'v'); // Repeated checks of role 1 must not call the setter.
+   for (unsigned i = 0; i < 2; ++i) {
+      command(s, 'b'); // Simulate another policy owner changing the role.
+      npt_work_context_set_active(true);
+      command(s, 'v');
+   }
+   npt_work_context_set_active(false);
+   usleep(200000); // Allow the asynchronous inactive control message to arrive.
+   command(s, 'v'); // Inactive must not write a replacement role itself.
+   command(s, 'b');
+   command(s, 'i'); // Device notifications cannot promote an inactive worker.
+   npt_work_context_set_active(false);
+   command(s, 'i');
+   command(s, 'r'); // Inactive maintenance leaves BANK attribution intact.
+   npt_work_context_set_active(true);
+   command(s, 'v');
+   // The Python harness checks the real setter logs, including no-op requests.
+   fprintf(stderr, "EXPECT role-sets pid=%d count=4\n", s.pid);
+}
+
 static void stop(session &s)
 {
    npt_work_context_client_destroy(s.client);
@@ -239,47 +265,104 @@ static int startup_races(const char *service)
    return 0;
 }
 
+static int probe_service(const char *service)
+{
+   assert(!npt_work_context_probe_service(nullptr, 100));
+   assert(!npt_work_context_probe_service("", 100));
+   assert(!npt_work_context_probe_service(service, 0));
+   std::string missing = std::string(service) + ".missing";
+   for (unsigned i = 0; i < 32; ++i) {
+      assert(npt_work_context_probe_service(service, 1000) == 1);
+      assert(npt_work_context_probe_service(missing.c_str(), 100) == 0);
+   }
+   assert(npt_work_context_status() == 0);
+   fprintf(stderr, "PASS service-probe: 32 real pongs, 32 unavailable, invalid arguments, no render session\n");
+   return 0;
+}
+
 int main(int argc, char **argv)
 {
    if (argc == 3 && !strcmp(argv[1], "--startup-races"))
       return startup_races(argv[2]);
    if (argc == 3 && !strcmp(argv[1], "--service"))
       return npt_work_context_service_main(argv[2]);
+   if (argc == 3 && !strcmp(argv[1], "--probe"))
+      return probe_service(argv[2]);
    if (argc == 4 && !strcmp(argv[1], "--worker"))
       return worker_main(atoi(argv[2]), atoi(argv[3]) != 0);
    assert(argc == 4);
    setenv("NPT_WORK_CONTEXT_SERVICE", argv[1], 1);
    const char *mode = argv[3];
+   npt_work_context_set_active(true); // UI activity can precede renderer init.
+   npt_work_context_status_reset(); // Must preserve that latest activity value.
+   bool inactive_before_ready = !strcmp(mode, "device-first-inactive");
+   bool inactive_before_device = !strcmp(mode, "inactive-before-device");
+   bool device_first = !strcmp(mode, "device-first") || inactive_before_ready;
+   if (device_first) {
+      // The broker is stopped. Timed-out callbacks can arrive after resume,
+      // while this process continues running the ordinary session regression.
+      for (unsigned i = 0; i < 8; ++i) {
+         auto before = std::chrono::steady_clock::now();
+         assert(npt_work_context_probe_service(argv[1], 20) == 0);
+         assert(std::chrono::steady_clock::now() - before < std::chrono::seconds(1));
+      }
+      assert(npt_work_context_status() == 0);
+      fprintf(stderr, "PASS service-probe-timeout: 8 stopped-broker calls returned within bound\n");
+   }
    session first = start(argv[2], mode);
-   bool device_first = !strcmp(mode, "device-first");
    if (device_first) {
       // The Python harness has stopped only this test's broker until this ack.
       command(first, 'd');
+      if (inactive_before_ready) npt_work_context_set_active(false);
       printf("DEVICE_READY\n");
       fflush(stdout);
    }
-   bool success = !strcmp(mode, "success") || !strcmp(mode, "aggregate") || device_first;
+   bool success = !strcmp(mode, "success") || !strcmp(mode, "aggregate") ||
+                  device_first || inactive_before_device;
    wait_status(success ? 1 : -1);
-   command(first, success ? (device_first ? 'v' : 'a') : 'd');
+   if (inactive_before_device) {
+      npt_work_context_set_active(false);
+      usleep(200000);
+   }
+   if (!success || inactive_before_ready || inactive_before_device)
+      command(first, 'd');
+   else if (!device_first)
+      command(first, 'a');
+   if (success) {
+      if (inactive_before_ready || inactive_before_device)
+         npt_work_context_set_active(true);
+      check_maintenance(first);
+   }
    command(first, success ? 'r' : 'f');
    if (!strcmp(mode, "success")) {
       usleep(5300000); // Outlive broker setup timeout and the old token expiry.
       wait_status(1);
+      npt_work_context_set_active(true);
+      command(first, 'v');
       command(first, 'r');
    }
    if (!strcmp(mode, "aggregate")) {
       session second = start(argv[2], "unsupported");
       wait_status(-1);
+      command(second, 'd');
       stop(second);
       wait_status(1);
       command(first, 'r');
    }
+   std::thread publisher([] {
+      for (unsigned i = 0; i < 64; ++i) {
+         npt_work_context_set_active(i % 2 == 0);
+         usleep(100);
+      }
+   });
    npt_work_context_client_destroy(first.client);
    first.client = nullptr;
+   publisher.join();
+   npt_work_context_set_active(true); // The removed client cannot be revisited.
    wait_status(0);
    command(first, 'f');
    stop(first);
    wait_status(0);
-   fprintf(stderr, "PASS %s: device/ready role gate, one policy attempt, scoped BANK, concurrent/nested calls, exception restore, close/status\n", mode);
+   fprintf(stderr, "PASS %s: active role repair, inactive/late-ready gates, registry teardown, scoped BANK, concurrent/nested calls, exception restore, close/status\n", mode);
    return 0;
 }
