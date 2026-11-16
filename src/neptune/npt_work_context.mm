@@ -6,6 +6,7 @@
  */
 #import <Foundation/Foundation.h>
 #include <Block.h>
+#include <atomic>
 #include <exception>
 #include <dispatch/dispatch.h>
 #include <mach/mach.h>
@@ -115,6 +116,7 @@ static void snapshot(const char *stage, uint32_t ctx, uint64_t sequence)
 struct call_frame {
    void (*function)(void *);
    void *argument;
+   const char *stage;
    uint32_t context_id;
    uint64_t sequence;
    bool trace;
@@ -126,10 +128,22 @@ static thread_local struct call_frame *current_call;
 static void invoke_current_call(void)
 {
    struct call_frame *frame = current_call;
-   if (frame->trace) snapshot("execute-inside", frame->context_id, frame->sequence);
+   if (frame->trace) snapshot(frame->stage, frame->context_id, frame->sequence);
    /* libdispatch blocks must return normally even if the native call throws. */
    try { frame->function(frame->argument); }
    catch (...) { frame->exception = std::current_exception(); }
+}
+
+static void run_with_carrier(dispatch_block_t carrier, struct call_frame &frame)
+{
+   current_call = &frame;
+   carrier();
+   current_call = frame.previous;
+}
+
+static void invoke_metal_submit(void *argument)
+{
+   ((dispatch_block_t)argument)();
 }
 
 @interface NptWorkContext : NSObject {
@@ -141,6 +155,7 @@ static void invoke_current_call(void)
    xpc_object_t unfinished_reply;
    pthread_mutex_t mutex;
    dispatch_block_t carrier;
+   npt_work_context_set_metal_runner set_metal_runner;
    uint64_t sequence;
    bool closing, tracked, trace, device_ready, active;
    unsigned generation;
@@ -212,6 +227,10 @@ static void cancel_connection(xpc_connection_t *connection)
 - (void)closeConnections
 {
    /* This method and every connection callback run on our serial queue. */
+   if (set_metal_runner) {
+      set_metal_runner(NULL);
+      set_metal_runner = NULL;
+   }
    pthread_mutex_lock(&mutex);
    dispatch_block_t old = carrier;
    carrier = NULL;
@@ -419,7 +438,8 @@ void npt_work_context_client_destroy(void *client)
 
 void *npt_work_context_worker_create(uint32_t context_id,
                                     const struct npt_work_context_config *config,
-                                    bool supported)
+                                    bool supported,
+                                    npt_work_context_set_metal_runner set_metal_runner)
 {
    const char *service = getenv("NPT_WORK_CONTEXT_SERVICE");
    if (!config->owner_pid || !service || !*service) return NULL;
@@ -427,6 +447,7 @@ void *npt_work_context_worker_create(uint32_t context_id,
    worker->context_id = context_id;
    worker->worker_pid = (uint32_t)getpid();
    worker->config = *config;
+   worker->set_metal_runner = set_metal_runner;
    char *service_copy = strdup(service);
    /* Setup, error handling and teardown share one queue: an immediately failed
     * broker cannot release listener/broker while setup is still using them. */
@@ -490,6 +511,23 @@ void *npt_work_context_worker_create(uint32_t context_id,
             pthread_mutex_lock(&worker->mutex);
             worker->carrier = captured;
             pthread_mutex_unlock(&worker->mutex);
+            if (worker->set_metal_runner) {
+               /* Copying the runner retains the carrier without retaining the
+                * worker. An in-flight call can finish after disconnection. */
+               const uint32_t context_id = worker->context_id;
+               const bool trace = worker->trace;
+               worker->set_metal_runner(^(const char *stage, dispatch_block_t submit) {
+                  static std::atomic<uint64_t> sequence{0};
+                  const uint64_t number = trace ? ++sequence : 0;
+                  struct call_frame frame = {
+                     .function = invoke_metal_submit, .argument = (void *)submit, .stage = stage,
+                     .context_id = context_id, .sequence = number,
+                     .trace = trace && number <= 128, .previous = current_call,
+                  };
+                  run_with_carrier(captured, frame);
+                  if (frame.exception) std::rethrow_exception(frame.exception);
+               });
+            }
             [worker setState:1];
             xpc_object_t ready = session_message(worker, "ready");
             xpc_dictionary_set_bool(ready, "supported", true);
@@ -557,7 +595,7 @@ void npt_work_context_execute(void *opaque, uint64_t ring_id, uint32_t head,
    pthread_mutex_unlock(&worker->mutex);
    if (!captured) { function(argument); return; }
    struct call_frame frame = {
-      .function = function, .argument = argument, .context_id = worker->context_id,
+      .function = function, .argument = argument, .stage = "execute-inside", .context_id = worker->context_id,
       .sequence = sequence, .trace = worker->trace && sequence <= 128,
       .previous = current_call,
    };
@@ -567,9 +605,7 @@ void npt_work_context_execute(void *opaque, uint64_t ring_id, uint32_t head,
               (unsigned long long)ring_id, head, queue, count);
       snapshot("execute-before", frame.context_id, sequence);
    }
-   current_call = &frame;
-   captured();
-   current_call = frame.previous;
+   run_with_carrier(captured, frame);
    if (frame.trace) snapshot("execute-after", frame.context_id, sequence);
    Block_release(captured);
    if (frame.exception) std::rethrow_exception(frame.exception);

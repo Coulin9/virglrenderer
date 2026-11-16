@@ -273,7 +273,14 @@ npt_renderer_set_work_context(uint32_t ctx_id,
       return;
    bool supported = npt_state.library.pfn_supports_xpc_work_context &&
                     npt_state.library.pfn_supports_xpc_work_context();
-   ctx->work_context = npt_work_context_worker_create(ctx_id, config, supported);
+   npt_work_context_set_metal_runner set_metal_runner = NULL;
+#ifdef ENABLE_RENDER_SERVER_WORKER_PROCESS
+   /* Mullion's native threads all belong to this process's one context. */
+   set_metal_runner = npt_state.library.pfn_set_metal_runner;
+#endif
+   ctx->work_context = npt_work_context_worker_create(ctx_id, config,
+                                                     supported || set_metal_runner,
+                                                     set_metal_runner);
 }
 
 void

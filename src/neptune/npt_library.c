@@ -152,6 +152,10 @@ npt_library_load_embedder_api(struct npt_d3d_library *lib)
                .p = dlsym(mod, "dmn_supports_xpc_work_context") }).f;
          dlerror();
       }
+      if (lib->backend == NPT_BACKEND_MULLION) {
+         lib->pfn_set_metal_runner = ((union { void *p; npt_work_context_set_metal_runner f; }){
+            .p = npt_library_embedder_sym_optional(mod, prefix, "set_work_context_metal_runner") }).f;
+      }
 
       lib->pfn_event_create =
          ((union { void *p; PFN_dxn_event_create f; }){

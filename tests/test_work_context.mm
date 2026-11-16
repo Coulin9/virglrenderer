@@ -3,6 +3,7 @@
  * real arm64 -> x86_64 XPC IPC; no D3DMetal, VM, or game is required.
  */
 #include "neptune/npt_work_context.h"
+#include <Block.h>
 #include <mach/mach.h>
 #include <mach/mach_voucher.h>
 #include <mach/task_policy.h>
@@ -17,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -77,6 +79,41 @@ static void throws(void *)
    throw std::runtime_error("native call failure");
 }
 
+static std::mutex metal_runner_mutex;
+static npt_work_context_metal_runner metal_runner;
+
+static void set_metal_runner(npt_work_context_metal_runner runner)
+{
+   std::lock_guard lock(metal_runner_mutex);
+   if (metal_runner) Block_release(metal_runner);
+   metal_runner = nullptr;
+   if (runner) metal_runner = Block_copy(runner);
+}
+
+static void check_metal_runner(pid_t owner, bool expected)
+{
+   std::thread submitter([=] {
+      npt_work_context_metal_runner runner = nullptr;
+      {
+         std::lock_guard lock(metal_runner_mutex);
+         if (metal_runner) runner = Block_copy(metal_runner);
+      }
+      assert((runner != nullptr) == expected);
+      if (!runner) return;
+      char before[512] = {}, after[512] = {};
+      bank(before, sizeof(before));
+      std::atomic<unsigned> count{0};
+      check_call call{nullptr, owner, true, false, &count};
+      check_call *arg = &call;
+      runner("metal-test-submit", ^{ verify(arg); });
+      assert(count == 1);
+      bank(after, sizeof(after));
+      assert(!strcmp(before, after));
+      Block_release(runner);
+   });
+   submitter.join();
+}
+
 static void run_calls(void *worker, pid_t owner, bool expected)
 {
    std::atomic<unsigned> count{0};
@@ -130,7 +167,7 @@ static int worker_main(int fd, bool supported)
    assert(initial_role != TASK_FOREGROUND_APPLICATION);
    npt_work_context_config config;
    transfer(fd, &config, sizeof(config), false);
-   void *worker = npt_work_context_worker_create(1, &config, supported);
+   void *worker = npt_work_context_worker_create(1, &config, supported, set_metal_runner);
    char command;
    while (read(fd, &command, 1) == 1) {
       if (command == 'q') break;
@@ -154,6 +191,7 @@ static int worker_main(int fd, bool supported)
       } else {
          if (command == 'f') usleep(200000); // Allow asynchronous peer cancellation.
          run_calls(worker, static_cast<pid_t>(config.owner_pid), command == 'r');
+         check_metal_runner(static_cast<pid_t>(config.owner_pid), command == 'r');
       }
       transfer(fd, &command, 1, true);
    }
@@ -252,7 +290,7 @@ static int startup_races(const char *service)
       npt_work_context_config config{};
       config.owner_pid = static_cast<uint32_t>(getppid());
       arc4random_buf(config.nonce, sizeof(config.nonce));
-      void *worker = npt_work_context_worker_create(i + 1, &config, true);
+      void *worker = npt_work_context_worker_create(i + 1, &config, true, nullptr);
       assert(worker);
       // Exercise both immediate close and broker failure racing startup.
       if (i % 2) usleep(1000);
@@ -363,6 +401,6 @@ int main(int argc, char **argv)
    command(first, 'f');
    stop(first);
    wait_status(0);
-   fprintf(stderr, "PASS %s: active role repair, inactive/late-ready gates, registry teardown, scoped BANK, concurrent/nested calls, exception restore, close/status\n", mode);
+   fprintf(stderr, "PASS %s: role repair, scoped BANK, concurrent/nested calls, Metal submit thread, exception restore, close/status\n", mode);
    return 0;
 }

@@ -10,6 +10,7 @@
 #include "neptune-protocol/npt_protocol_host_dispatch_types.h"
 
 #include "npt_library_names.h"
+#include "npt_work_context.h"
 
 #include <directx-native/dxn_embedder.h>
 
@@ -100,6 +101,7 @@ struct npt_d3d_library {
    void (*pfn_hook_stats_flush)(void);
    /* True only when the native asynchronous submission path carries IPC context. */
    bool (*pfn_supports_xpc_work_context)(void);
+   npt_work_context_set_metal_runner pfn_set_metal_runner;
    enum npt_backend_kind backend;
 
    /* NPT_WA_* bits describing the workarounds the loaded backend needs, set in
