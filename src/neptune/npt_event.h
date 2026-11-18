@@ -115,6 +115,11 @@ void npt_event_queue_complete(struct npt_context *ctx,
                               struct npt_event_proxy *pr);
 void npt_event_queue_irq(struct npt_context *ctx);
 
+/* EVENT_QUEUE_KICK: publish the sentinel token 0 and interrupt if a
+ * guest waiter exists, so a dispatcher sleeping in COUNTER_WAIT exits
+ * its slice and can observe teardown. */
+void npt_event_queue_kick(struct npt_context *ctx);
+
 /* Queue-mode retirement: drop the guest's registration reference on
  * `pr` (keyed by `token`, read before the arm reference was released),
  * but only when this exact proxy is still the table entry. */

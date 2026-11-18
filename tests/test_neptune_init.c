@@ -103,8 +103,14 @@ test_neptune_get_capset(void)
    const uint32_t backend_bits = dxmt_bits |
       VIRGL_RENDERER_CAPSET_NEPTUNE_CAP_EXTENDED_RESOURCE_SHARING |
       VIRGL_RENDERER_CAPSET_NEPTUNE_CAP_DXIL;
+#ifdef __APPLE__
    EXPECT((caps.caps_flags & backend_bits) ==
           VIRGL_RENDERER_CAPSET_NEPTUNE_CAP_DXIL); /* default = d3dmetal */
+#else
+   /* No Linux backend is validated for the UMD's DXIL path; the default
+    * advertises only EXTERNAL_BUFFERS, which carries no backend bit. */
+   EXPECT((caps.caps_flags & backend_bits) == 0);
+#endif
 
    setenv("NPT_BACKEND", "dxmt", 1);
    virgl_renderer_fill_caps(VIRTGPU_DRM_CAPSET_NEPTUNE, 0, &caps);

@@ -825,6 +825,9 @@ npt_dispatch_subgroup_event(struct npt_context *ctx,
    case NPT_TRANSPORT_EVENT_ARM_QUEUE:
       npt_dispatch_arm_event_queue(ctx, dec, enc, header);
       return true;
+   case NPT_TRANSPORT_EVENT_QUEUE_KICK:
+      npt_event_queue_kick(ctx);
+      return true;
    case NPT_TRANSPORT_EVENT_GATE_WAIT:
       npt_dispatch_gate_wait(ctx, dec, enc, header);
       return true;

@@ -79,6 +79,11 @@ proxy_context_on_worker_exit(struct proxy_worker *worker, void *udata)
       proxy_status_page_mark_lost(page, NPT_CONTEXT_STATUS_LOST_WORKER_EXIT,
                                   render_ring_now_ns());
    atomic_store_explicit(&ctx->worker_dead, true, memory_order_seq_cst);
+   /* Wake guest COUNTER_WAIT sleepers directly: the dead worker can no
+    * longer set irq_pending, and only a config interrupt or a
+    * COUNTER_WAIT slice timeout re-checks the lost word. */
+   if (page && proxy_renderer.cbs->context_irq)
+      proxy_renderer.cbs->context_irq(ctx->base.ctx_id);
    render_wake_signal(ctx->worker.completion_wake);
 }
 #endif
@@ -357,6 +362,8 @@ proxy_context_sync_thread(void *arg)
             if (page)
                proxy_status_page_mark_lost(page, NPT_CONTEXT_STATUS_LOST_WORKER_EXIT,
                                            render_ring_now_ns());
+            if (page && proxy_renderer.cbs->context_irq)
+               proxy_renderer.cbs->context_irq(ctx->base.ctx_id);
             close(death_fd);
             ctx->death_read_fd = -1;
             proxy_context_retire_fences_internal(ctx);

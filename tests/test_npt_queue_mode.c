@@ -144,6 +144,24 @@ fake_event_signal(void *handle)
    (void)n;
 }
 
+/* The last wait fd a pairing handed to the sync queue.  On Linux the
+ * events are eventfds and this fd is a writable dup of the same
+ * counter; on darwin the backend handle (last_event) is signalled
+ * instead. */
+static int last_paired_fd = -1;
+
+static void
+test_fire_event(void)
+{
+#ifdef __APPLE__
+   fake_event_signal(last_event);
+#else
+   uint64_t t = 1;
+   ssize_t n = write(last_paired_fd, &t, sizeof(t));
+   (void)n;
+#endif
+}
+
 static struct npt_d3d_library fake_lib;
 
 struct npt_d3d_library *
@@ -257,6 +275,7 @@ npt_context_pair_event_fence(struct npt_context *ctx,
 {
    if (ring_idx >= ARRAY_SIZE(ctx->sync_queues))
       return false;
+   last_paired_fd = paired->fd;
    if (!ctx->sync_queues[ring_idx])
       ctx->sync_queues[ring_idx] = npt_queue_create(ctx, ring_idx);
    if (!ctx->sync_queues[ring_idx]) {
@@ -347,7 +366,7 @@ main(void)
 
    /* Fire the proxy: the sync entry publishes the token without any
     * guest fence, and retire_fence is never called. */
-   fake_event_signal(last_event);
+   test_fire_event();
    CHECK(wait_for(&page->evt_tail, 1, 5000),
          "queue arm published token on fire");
    CHECK(atomic_load_explicit(&page->evt_tokens[0],
@@ -365,10 +384,34 @@ main(void)
    CHECK(fd >= 0, "old-path arm popped");
    CHECK(npt_context_pair_event_fence(ctx, ring2, 999, &out),
          "old-path paired");
-   fake_event_signal(last_event);
+   test_fire_event();
    CHECK(wait_for(&retire_calls, 1, 5000),
          "old-path fence retired");
    CHECK(retire_last_id == 999, "old-path retired fence id");
+
+   /* EVENT_QUEUE_KICK: publishes the sentinel token 0 and raises an
+    * interrupt only when a guest waiter exists. */
+   {
+      const uint64_t tail =
+         atomic_load_explicit(&page->evt_tail, memory_order_acquire);
+      const int wakes_before = status_wakes;
+      npt_event_queue_kick(ctx);
+      CHECK(atomic_load_explicit(&page->evt_tokens[
+                                    tail % NPT_COMPLETION_QUEUE_SIZE],
+                                 memory_order_acquire) == 0,
+            "kick publishes token 0");
+      CHECK(atomic_load_explicit(&page->evt_tail,
+                                 memory_order_acquire) == tail + 1,
+            "kick advances tail");
+      CHECK(status_wakes == wakes_before, "no irq without waiters");
+
+      atomic_store(&page->guest_waiters, 1);
+      npt_event_queue_kick(ctx);
+      CHECK(atomic_load(&page->irq_pending) == 1, "kick latches irq_pending");
+      CHECK(status_wakes == wakes_before + 1, "kick interrupts waiter");
+      atomic_store(&page->guest_waiters, 0);
+      atomic_store(&page->irq_pending, 0);
+   }
 
    for (unsigned i = 0; i < ARRAY_SIZE(ctx->sync_queues); i++) {
       if (ctx->sync_queues[i]) {

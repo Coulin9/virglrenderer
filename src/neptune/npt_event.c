@@ -517,6 +517,19 @@ npt_event_queue_irq(struct npt_context *ctx)
       ctx->status_wake(ctx->status_wake_opaque);
 }
 
+/* Token 0 is never a valid arm token: npt_event_arm_queue rejects it,
+ * and the guest inserts only real HANDLE tokens into its arm table, so
+ * the dispatcher drops it like any unknown token. */
+void
+npt_event_queue_kick(struct npt_context *ctx)
+{
+   if (!ctx->status_page)
+      return;
+   if (!npt_completion_publish(&ctx->evt_producer, ctx->status_page, 0))
+      npt_log("event: queue kick publish failed");
+   npt_event_queue_irq(ctx);
+}
+
 /* Caller holds ctx->event_mutex.  Passing `e` from an existing
  * lookup avoids a re-search; NULL forces a fresh lookup. */
 static void event_seoc_release_all(void **fences, uint32_t count);

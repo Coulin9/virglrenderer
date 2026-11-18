@@ -11,6 +11,10 @@
  * honours the wire contract (read the header once, consume cmd_size).
  */
 
+#ifndef __APPLE__
+#define _GNU_SOURCE /* pthread_cond_clockwait */
+#endif
+
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -48,7 +52,19 @@ npt_cnd_wait_rel_ns(cnd_t *cond, mtx_t *mutex, uint64_t ns)
       .tv_sec = (time_t)(ns / ns_per_sec),
       .tv_nsec = (long)(ns % ns_per_sec),
    };
+#ifdef __APPLE__
    const int rc = pthread_cond_timedwait_relative_np(cond, mutex, &rel);
+#else
+   struct timespec abs;
+   clock_gettime(CLOCK_MONOTONIC, &abs);
+   abs.tv_sec += rel.tv_sec;
+   abs.tv_nsec += rel.tv_nsec;
+   if (abs.tv_nsec >= (long)ns_per_sec) {
+      abs.tv_sec++;
+      abs.tv_nsec -= (long)ns_per_sec;
+   }
+   const int rc = pthread_cond_clockwait(cond, mutex, CLOCK_MONOTONIC, &abs);
+#endif
    if (rc == 0)
       return thrd_success;
    return rc == ETIMEDOUT ? thrd_timeout : thrd_error;
@@ -66,6 +82,15 @@ npt_log(const char *fmt, ...)
    vfprintf(stderr, fmt, ap);
    fputc('\n', stderr);
    va_end(ap);
+}
+
+void
+_debug_assert_fail(const char *expr, const char *file, unsigned line,
+                   const char *func)
+{
+   fprintf(stderr, "test_npt_ring_decode: debug_assert %s failed at %s:%u (%s)\n",
+           expr, file, line, func);
+   abort();
 }
 
 uint64_t

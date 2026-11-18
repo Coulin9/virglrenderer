@@ -456,10 +456,6 @@ render_worker_jail_detach_workers(struct render_worker_jail *jail)
 #include <stdlib.h>
 #include <string.h>
 
-#include "render_context.h"
-#include "render_spawn.h"
-#include "virglrenderer.h"
-
 #endif /* ENABLE_RENDER_SERVER_WORKER_PROCESS && __APPLE__ */
 
 struct render_worker *
@@ -482,12 +478,13 @@ render_worker_create(struct render_worker_jail *jail,
    bool ok;
 #if defined(ENABLE_RENDER_SERVER_WORKER_PROCESS)
 #ifdef __APPLE__
-   {
-      const struct render_context_args *ctx_args =
-         (const struct render_context_args *)worker->thread_data;
-      worker->pid = render_spawn_worker(ctx_args, NULL);
-      ok = worker->pid >= 0;
-   }
+   /* The proxy spawns workers directly with their Mach wake ports
+    * registered; a server-mode spawn has no ports to hand over and the
+    * worker cannot run, so fail fast instead of starting a doomed
+    * child. */
+   render_log("server-mode worker spawn is unsupported on macOS; the "
+              "proxy spawns workers directly");
+   ok = false;
 #else
    worker->pid = fork();
    ok = worker->pid >= 0;

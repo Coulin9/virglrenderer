@@ -519,6 +519,11 @@ struct npt_cmd_shared_open_res_reply {
 #define NPT_TRANSPORT_EVENT_RELEASE   2u
 #define NPT_TRANSPORT_EVENT_GATE_WAIT 3u
 #define NPT_TRANSPORT_EVENT_ARM_QUEUE 4u
+/* Async, no payload, no reply: wakes the guest's queue-mode dispatcher.
+ * The host publishes the sentinel token 0 (never a valid arm token) into
+ * the completion queue and raises irq_pending, so a dispatcher sleeping
+ * in COUNTER_WAIT exits its slice and can observe dispatch_join. */
+#define NPT_TRANSPORT_EVENT_QUEUE_KICK 5u
 
 /* Token = (uintptr_t) of the guest-side HANDLE. */
 struct npt_cmd_register_event {

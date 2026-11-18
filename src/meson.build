@@ -182,10 +182,13 @@ proxy_sources = [
    'proxy/proxy_renderer.c',
    'proxy/proxy_server.c',
    'proxy/proxy_socket.c',
-   'proxy/proxy_monitor.c',
    'proxy/proxy_worker.c',
    '../server/render_spawn.c',
 ]
+
+if host_machine.system() == 'darwin'
+   proxy_sources += ['proxy/proxy_monitor.c']
+endif
 
 if with_render_server == 'thread'
    proxy_sources += [
