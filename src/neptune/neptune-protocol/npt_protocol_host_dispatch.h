@@ -5400,52 +5400,64 @@ npt_dispatch_toplevel(struct npt_dispatch_context *ctx,
 /* Main dispatch entry point                                           */
 /* ================================================================== */
 
+/* The caller read _hdr from the stream already: every wire command goes
+ * through one header fetch so the bytes behind a live, guest-mutable
+ * stream cannot present two different headers. */
 static inline void
-npt_dispatch_command(struct npt_dispatch_context *ctx)
+npt_dispatch_command_with_header(struct npt_dispatch_context *ctx,
+                                 const struct npt_command_header *_hdr)
 {
     struct npt_cs_decoder *const _dec = ctx->decoder;
-    const uint8_t *const _start = _dec->cur;
+    const uint8_t *const _start = _dec->cur - sizeof(*_hdr);
     const uint8_t *const _stream_end = _dec->end;
-    struct npt_command_header _hdr;
-    npt_cs_decoder_read(_dec, sizeof(_hdr), &_hdr, sizeof(_hdr));
-    if (npt_cs_decoder_get_fatal(_dec))
-        return;
 
     /* cmd_size is authoritative: the command decodes inside its own
      * bytes, and the next one starts at cmd_size whatever the decoder
      * consumed, so a sender's sizing slip cannot turn the rest of this
      * command into the next one's header. */
-    if (_hdr.cmd_size < sizeof(_hdr) ||
-        _hdr.cmd_size > (size_t)(_stream_end - _start)) {
+    if (_hdr->cmd_size < sizeof(*_hdr) ||
+        _hdr->cmd_size > (size_t)(_stream_end - _start)) {
         npt_log("dispatch: cmd_size %u out of range for cmd_type=0x%08x",
-                (unsigned)_hdr.cmd_size, (unsigned)_hdr.cmd_type);
+                (unsigned)_hdr->cmd_size, (unsigned)_hdr->cmd_type);
         npt_cs_decoder_set_fatal(_dec);
         return;
     }
-    _dec->end = _start + _hdr.cmd_size;
+    _dec->end = _start + _hdr->cmd_size;
 
-    const uint32_t _group = (_hdr.cmd_type >> 24) & 0xFF;
+    const uint32_t _group = (_hdr->cmd_type >> 24) & 0xFF;
 
     if (_group == 255) {
         /* COM call: interface_id and method_index come straight from
          * cmd_type (no per-call GUID on the wire; pinned interface IDs
          * live in neptune-protocol/npt_interface_ids.json). */
-        const uint16_t _interface_id = (_hdr.cmd_type >> 8) & 0xFFFFu;
-        const uint8_t _method_index = _hdr.cmd_type & 0xFFu;
+        const uint16_t _interface_id = (_hdr->cmd_type >> 8) & 0xFFFFu;
+        const uint8_t _method_index = _hdr->cmd_type & 0xFFu;
         npt_dispatch_com_call(ctx, _interface_id, _method_index,
-                              _hdr.cmd_flags, _hdr.object_id);
+                              _hdr->cmd_flags, _hdr->object_id);
     } else if (_group >= 1 && _group <= 3) {
-        const uint32_t _func_id = _hdr.cmd_type & 0x00FFFFFF;
-        npt_dispatch_toplevel(ctx, _group, _func_id, _hdr.cmd_flags);
+        const uint32_t _func_id = _hdr->cmd_type & 0x00FFFFFF;
+        npt_dispatch_toplevel(ctx, _group, _func_id, _hdr->cmd_flags);
     } else {
         npt_cs_decoder_set_fatal(ctx->decoder);
     }
 
-    _dec->cur = _start + _hdr.cmd_size;
+    _dec->cur = _start + _hdr->cmd_size;
     _dec->end = _stream_end;
 
     if (npt_cs_decoder_get_fatal(_dec))
-        npt_log("dispatch error for cmd_type=0x%08x", _hdr.cmd_type);
+        npt_log("dispatch error for cmd_type=0x%08x", _hdr->cmd_type);
+}
+
+/* Standalone entry for callers that did not read the header themselves
+ * (tests, the context command path). */
+static inline void
+npt_dispatch_command(struct npt_dispatch_context *ctx)
+{
+    struct npt_command_header _hdr;
+    npt_cs_decoder_read(ctx->decoder, sizeof(_hdr), &_hdr, sizeof(_hdr));
+    if (npt_cs_decoder_get_fatal(ctx->decoder))
+        return;
+    npt_dispatch_command_with_header(ctx, &_hdr);
 }
 
 #pragma GCC diagnostic pop

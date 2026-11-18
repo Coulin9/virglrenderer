@@ -283,13 +283,6 @@ static inline uint64_t npt_decode_array_count_unchecked(struct npt_cs_decoder *d
     return count;
 }
 
-static inline uint64_t npt_peek_array_count(struct npt_cs_decoder *dec)
-{
-    uint64_t count;
-    npt_cs_decoder_peek(dec, sizeof(count), &count, sizeof(count));
-    return count;
-}
-
 /*
  * Counted pointers historically used count=0 for both NULL+0 and
  * non-NULL+0, losing pointer presence.  Keep the one-word wire format:

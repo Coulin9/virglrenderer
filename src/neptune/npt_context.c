@@ -1562,28 +1562,50 @@ bool
 npt_context_dispatch_one_command(struct npt_context *ctx,
                                  struct npt_dispatch_context *dispatch,
                                  struct npt_cs_decoder *dec,
-                                 struct npt_cs_encoder *enc)
+                                 struct npt_cs_encoder *enc,
+                                 struct npt_command_header *hdr)
 {
-   struct npt_command_header peek;
-   npt_cs_decoder_peek(dec, sizeof(peek), &peek, sizeof(peek));
+   /* The header is read exactly once, here: the stream may be shared
+    * memory a guest vCPU is still writing, so a peeked group and a
+    * re-read header could disagree. */
+   const uint8_t *const start = dec->cur;
+   struct npt_command_header cmd;
+   npt_cs_decoder_read(dec, sizeof(cmd), &cmd, sizeof(cmd));
    if (npt_cs_decoder_get_fatal(dec))
       return false;
 
-   const uint32_t group = (peek.cmd_type >> 24) & 0xFFu;
+   if (cmd.cmd_size < sizeof(cmd) ||
+       cmd.cmd_size > (size_t)(dec->end - start)) {
+      npt_log("dispatch_one: cmd_size %u out of range for cmd_type=0x%08x",
+              (unsigned)cmd.cmd_size, (unsigned)cmd.cmd_type);
+      npt_cs_decoder_set_fatal(dec);
+      return false;
+   }
+
+   if (hdr)
+      *hdr = cmd;
+
+   const uint32_t group = (cmd.cmd_type >> 24) & 0xFFu;
 
    if (group == 0) {
-      npt_cs_decoder_read(dec, sizeof(peek), &peek, sizeof(peek));
-      if (!npt_transport_dispatch(ctx, dispatch, dec, enc, &peek)) {
+      /* The generated dispatcher's bound, applied to transport too:
+       * a command decodes inside its own bytes and the next one starts
+       * at cmd_size. */
+      const uint8_t *const stream_end = dec->end;
+      dec->end = start + cmd.cmd_size;
+      if (!npt_transport_dispatch(ctx, dispatch, dec, enc, &cmd)) {
          npt_log("unhandled transport command: cmd_type=0x%08x",
-                 peek.cmd_type);
+                 cmd.cmd_type);
+         dec->end = stream_end;
          npt_cs_decoder_set_fatal(dec);
          return false;
       }
+      dec->cur = start + cmd.cmd_size;
+      dec->end = stream_end;
       /* A matched transport handler may still set fatal; the common
        * tail check catches that. */
    } else {
-      /* Generated dispatcher reads its own header. */
-      npt_dispatch_command(dispatch);
+      npt_dispatch_command_with_header(dispatch, &cmd);
       /* Event handles the decode substituted stay pinned for the
        * duration of the call they were passed to. */
       npt_event_unpin_dispatched(ctx);
@@ -1610,7 +1632,7 @@ npt_context_submit_cmd(struct npt_context *ctx, const void *buffer, size_t size)
 
    while (npt_cs_decoder_has_command(dec)) {
       if (!npt_context_dispatch_one_command(ctx, &ctx->dispatch, dec,
-                                            &ctx->encoder)) {
+                                            &ctx->encoder, NULL)) {
          npt_log("context %u: dispatch failed", ctx->ctx_id);
          npt_cs_decoder_reset(dec);
          return false;

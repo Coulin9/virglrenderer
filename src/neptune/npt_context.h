@@ -275,15 +275,19 @@ npt_context_destroy(struct npt_context *ctx);
 bool
 npt_context_submit_cmd(struct npt_context *ctx, const void *buffer, size_t size);
 
-/* Peek one command header, route to transport dispatch (group 0) or
- * the generated protocol dispatcher otherwise.  Shared by context and
- * ring submit_cmd loops.  Returns false on group-0 with no handler
- * (decoder left fatal); otherwise true (caller checks get_fatal). */
+/* Read one command header -- the only fetch the stream sees for it --
+ * then route to transport dispatch (group 0) or the generated protocol
+ * dispatcher otherwise.  Shared by context and ring submit_cmd loops.
+ * `hdr` (may be NULL) receives the header that was dispatched, for
+ * callers that attribute work per command.  Returns false on a handler
+ * miss or validation failure (decoder left fatal); otherwise true
+ * (caller checks get_fatal). */
 bool
 npt_context_dispatch_one_command(struct npt_context *ctx,
                                  struct npt_dispatch_context *dispatch,
                                  struct npt_cs_decoder *dec,
-                                 struct npt_cs_encoder *enc);
+                                 struct npt_cs_encoder *enc,
+                                 struct npt_command_header *hdr);
 
 /* ring_idx 0 retires immediately on the CPU timeline; event rings
  * (>= NPT_EVENT_RING_BASE) wait on the pending ARM_EVENT_FENCE's

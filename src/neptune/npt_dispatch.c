@@ -488,7 +488,7 @@ npt_dispatch_execute_command_stream(struct npt_context *ctx,
    npt_cs_decoder_set_buffer_stream(dec, bytes, cmd.size);
 
    while (npt_cs_decoder_has_command(dec)) {
-      if (!npt_context_dispatch_one_command(ctx, dispatch, dec, enc))
+      if (!npt_context_dispatch_one_command(ctx, dispatch, dec, enc, NULL))
          break;
    }
 

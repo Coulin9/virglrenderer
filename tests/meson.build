@@ -196,6 +196,17 @@ if with_neptune
          '../src/gallium/include',
          '../subprojects/directx-native/include'))
    test('test_npt_queue_mode', test_npt_queue_mode)
+
+   test_npt_ring_decode = executable(
+      'test_npt_ring_decode',
+      ['test_npt_ring_decode.c', '../src/neptune/npt_ring.c',
+       '../src/neptune/npt_cs.c'],
+      include_directories : include_directories(
+         '..', '../src', '../src/mesa', '../src/mesa/compat',
+         '../src/neptune', '../src/gallium/auxiliary',
+         '../src/gallium/include',
+         '../subprojects/directx-native/include'))
+   test('test_npt_ring_decode', test_npt_ring_decode)
 endif
 
 if with_venus

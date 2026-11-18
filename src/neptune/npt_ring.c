@@ -106,24 +106,6 @@ npt_ring_unset_status_bits(struct npt_ring *ring, uint32_t mask)
    atomic_fetch_and_explicit(ring->control.status, ~mask, memory_order_seq_cst);
 }
 
-static void
-npt_ring_read_buffer(struct npt_ring *ring, void *data, uint32_t size)
-{
-   struct npt_ring_buffer *buf = &ring->buffer;
-
-   const size_t offset = buf->cur & buf->mask;
-   assert(size <= buf->size);
-   if (offset + size <= buf->size) {
-      memcpy(data, buf->data + offset, size);
-   } else {
-      const size_t s = buf->size - offset;
-      memcpy(data, buf->data + offset, s);
-      memcpy((uint8_t *)data + s, buf->data, size - s);
-   }
-
-   buf->cur += size;
-}
-
 /* dispatch.data stays pointing at the context so override functions
  * recover it the same way from either dispatch path. */
 static void
@@ -304,76 +286,148 @@ npt_ring_relax(uint32_t *iter)
 #endif
 }
 
-static bool
-npt_ring_submit_cmd(struct npt_ring *ring,
-                    const uint8_t *buffer,
-                    size_t size,
-                    uint32_t ring_head)
+/* Per-command housekeeping after head advances to `cur_ring_head`:
+ * publish the head, wake peer-seqno waiters, settle deferred-release
+ * watches, tell the context, then run the rate-limited feedback poll. */
+static void
+npt_ring_after_command(struct npt_ring *ring, uint32_t cur_ring_head)
+{
+   /* Publish head mid-stream so the producer can refill space. */
+   npt_ring_store_head(ring, cur_ring_head);
+
+   /* Dekker pairing with npt_ring_wait_peer_seqno: it registers as
+    * a waiter, fences, then reads the head; this side publishes the
+    * head, fences, then reads the waiter count.  One of the two
+    * always sees the other, so a waiter never sleeps on a head that
+    * was published without a broadcast. */
+   atomic_thread_fence(memory_order_seq_cst);
+   if (unlikely(atomic_load_explicit(&ring->peer_waiters,
+                                     memory_order_acquire)) &&
+       npt_seqno_ge(cur_ring_head,
+                    atomic_load_explicit(&ring->peer_wake_at,
+                                         memory_order_relaxed)))
+      npt_ring_wake(ring);
+
+   if (unlikely(atomic_load_explicit(&ring->watch_pending,
+                                     memory_order_relaxed)))
+      npt_ring_settle_watches(ring, cur_ring_head);
+
+   npt_context_on_ring_seqno_update(ring->context, ring->id, cur_ring_head);
+
+   /* A sustained batch keeps the ring busy for seconds at a time, so
+    * publishing feedback only once the ring drains would freeze the
+    * guest-visible fence values and stall every guest wait keyed on them.
+    * This runs on the dispatch thread, keeping the host D3D11 context
+    * single-threaded; the poll rate-limits itself and early-outs when
+    * nothing is pending. */
+   npt_feedback_poll(ring->context, &ring->feedback_poll_skip);
+}
+
+/* Dispatch the single command at `ptr`, whose size `expect->cmd_size`
+ * was validated by the caller.  `ptr` may be shared ring memory (in
+ * place) or ring->cmd (a gathered copy for a command that straddles the
+ * buffer end); the decoder bounds itself to the command's own cmd_size
+ * either way.  Returns the consumed size, 0 on failure (fatal is set). */
+static uint32_t
+npt_ring_dispatch_command(struct npt_ring *ring,
+                          const uint8_t *ptr,
+                          const struct npt_command_header *expect)
+{
+   struct npt_cs_decoder *dec = &ring->decoder;
+   npt_cs_decoder_set_buffer_stream(dec, ptr, expect->cmd_size);
+
+   const bool prof_enabled = npt_profile_enabled();
+   const uint64_t t0 = prof_enabled ? npt_profile_now_ns() : 0;
+
+   struct npt_command_header hdr;
+   if (!npt_context_dispatch_one_command(ring->context, &ring->dispatch,
+                                         dec, &ring->encoder, &hdr))
+      return 0;
+
+   /* `expect` and `hdr` are two reads of the same guest-published
+    * header; a mismatch means the guest rewrote bytes below its tail,
+    * and the two views of where the next command starts disagree. */
+   if (unlikely(hdr.cmd_size != expect->cmd_size)) {
+      npt_log("%s: cmd_size changed under decode (%u -> %u)",
+              __func__, expect->cmd_size, hdr.cmd_size);
+      npt_cs_decoder_set_fatal(dec);
+      return 0;
+   }
+
+   if (prof_enabled) {
+      const uint64_t dispatch_ns = npt_profile_now_ns() - t0;
+      npt_profile_record_dispatch(&ring->profile, hdr.cmd_type, dispatch_ns);
+      npt_profile_maybe_dump(&ring->profile);
+   }
+
+   return hdr.cmd_size;
+}
+
+/* Decode the commands in `[cur, tail)` in place over the shared ring
+ * buffer.  Each command that fits before the buffer end decodes
+ * directly out of shared memory; one whose header or body straddles
+ * the end is gathered into ring->cmd first.  The guest publishes the
+ * tail only at command boundaries, so a truncated command is a
+ * protocol violation, not a reason to wait for more bytes. */
+bool
+npt_ring_decode_available(struct npt_ring *ring, uint32_t tail)
 {
    struct npt_cs_decoder *dec = &ring->decoder;
    if (npt_cs_decoder_get_fatal(dec)) {
-      npt_log("ring_submit_cmd: early bail due to fatal decoder state");
+      npt_log("ring_decode: early bail due to fatal decoder state");
       return false;
    }
 
-   npt_cs_decoder_set_buffer_stream(dec, buffer, size);
-   const bool prof_enabled = npt_profile_enabled();
-   npt_profile_record_read(&ring->profile, (uint32_t)size);
+   struct npt_ring_buffer *buf = &ring->buffer;
+   uint32_t avail = tail - buf->cur;
+   npt_profile_record_read(&ring->profile, avail);
 
-   while (npt_cs_decoder_has_command(dec)) {
-      /* Peek for per-method attribution; the dispatcher peeks again. */
-      uint32_t cmd_type = 0;
-      uint64_t t0 = 0;
-      if (prof_enabled) {
-         struct npt_command_header peek;
-         npt_cs_decoder_peek(dec, sizeof(peek), &peek, sizeof(peek));
-         cmd_type = peek.cmd_type;
-         t0 = npt_profile_now_ns();
+   while (avail) {
+      const uint32_t off = buf->cur & buf->mask;
+      const uint32_t to_end = buf->size - off;
+
+      /* Gather the header; it may straddle the buffer end. */
+      struct npt_command_header hdr;
+      if (to_end >= sizeof(hdr)) {
+         memcpy(&hdr, buf->data + off, sizeof(hdr));
+      } else {
+         memcpy(&hdr, buf->data + off, to_end);
+         memcpy((uint8_t *)&hdr + to_end, buf->data, sizeof(hdr) - to_end);
       }
 
-      if (!npt_context_dispatch_one_command(ring->context, &ring->dispatch,
-                                            dec, &ring->encoder)) {
-         npt_log("ring_submit_cmd: dispatch failed");
+      if (hdr.cmd_size < sizeof(hdr) || hdr.cmd_size > avail ||
+          hdr.cmd_size > buf->size) {
+         npt_log("%s: cmd_size(%u) out of range (avail=%u size=%u)",
+                 __func__, hdr.cmd_size, avail, buf->size);
+         npt_cs_decoder_set_fatal(dec);
          npt_cs_decoder_reset(dec);
          return false;
       }
 
-      if (prof_enabled) {
-         const uint64_t dispatch_ns = npt_profile_now_ns() - t0;
-         npt_profile_record_dispatch(&ring->profile, cmd_type, dispatch_ns);
-         npt_profile_maybe_dump(&ring->profile);
+      const uint8_t *cmd_ptr;
+      if (off + hdr.cmd_size <= buf->size) {
+         /* Contiguous: decode in place out of the shared buffer. */
+         cmd_ptr = buf->data + off;
+      } else {
+         /* Straddles the end: gather into the private copy. */
+         const uint32_t s = buf->size - off;
+         memcpy(ring->cmd, buf->data + off, s);
+         memcpy((uint8_t *)ring->cmd + s, buf->data, hdr.cmd_size - s);
+         cmd_ptr = ring->cmd;
       }
 
-      /* Publish head mid-stream so the producer can refill space. */
-      const uint32_t cur_ring_head = ring_head + (dec->cur - buffer);
-      npt_ring_store_head(ring, cur_ring_head);
+      const uint32_t consumed =
+         npt_ring_dispatch_command(ring, cmd_ptr, &hdr);
+      if (!consumed) {
+         npt_log("ring_decode: dispatch failed");
+         npt_cs_decoder_reset(dec);
+         return false;
+      }
 
-      /* Dekker pairing with npt_ring_wait_peer_seqno: it registers as
-       * a waiter, fences, then reads the head; this side publishes the
-       * head, fences, then reads the waiter count.  One of the two
-       * always sees the other, so a waiter never sleeps on a head that
-       * was published without a broadcast. */
-      atomic_thread_fence(memory_order_seq_cst);
-      if (unlikely(atomic_load_explicit(&ring->peer_waiters,
-                                        memory_order_acquire)) &&
-          npt_seqno_ge(cur_ring_head,
-                       atomic_load_explicit(&ring->peer_wake_at,
-                                            memory_order_relaxed)))
-         npt_ring_wake(ring);
+      buf->cur += consumed;
+      avail -= consumed;
 
-      if (unlikely(atomic_load_explicit(&ring->watch_pending,
-                                        memory_order_relaxed)))
-         npt_ring_settle_watches(ring, cur_ring_head);
-
-      npt_context_on_ring_seqno_update(ring->context, ring->id, cur_ring_head);
-
-      /* A sustained batch keeps the ring busy for seconds at a time, so
-       * publishing feedback only once the ring drains would freeze the
-       * guest-visible fence values and stall every guest wait keyed on them.
-       * This runs on the dispatch thread, keeping the host D3D11 context
-       * single-threaded; the poll rate-limits itself and early-outs when
-       * nothing is pending. */
-      npt_feedback_poll(ring->context, &ring->feedback_poll_skip);
+      npt_ring_after_command(ring, buf->cur);
    }
 
    npt_cs_decoder_reset(dec);
@@ -524,19 +578,16 @@ npt_ring_thread(void *arg)
          idle_timed = false;
       }
 
-      const uint32_t cmd_size = npt_ring_load_tail(ring) - ring->buffer.cur;
-      if (cmd_size) {
-         if (cmd_size > ring->buffer.size) {
-            npt_log("%s: cmd_size(%u) > ring->buffer.size(%u)", __func__, cmd_size,
-                    ring->buffer.size);
+      const uint32_t tail = npt_ring_load_tail(ring);
+      if (tail != ring->buffer.cur) {
+         if (tail - ring->buffer.cur > ring->buffer.size) {
+            npt_log("%s: tail(%u) - cur(%u) > ring->buffer.size(%u)", __func__,
+                    tail, ring->buffer.cur, ring->buffer.size);
             ret = -EINVAL;
             break;
          }
 
-         const uint32_t ring_head = ring->buffer.cur;
-         npt_ring_read_buffer(ring, ring->cmd, cmd_size);
-
-         if (!npt_ring_submit_cmd(ring, ring->cmd, cmd_size, ring_head)) {
+         if (!npt_ring_decode_available(ring, tail)) {
             ret = -EINVAL;
             break;
          }

@@ -228,6 +228,12 @@ npt_ring_load_tail(const struct npt_ring *ring)
    return atomic_load_explicit(ring->control.tail, memory_order_acquire);
 }
 
+/* Decode every whole command in `[buffer.cur, tail)`, in place over the
+ * shared buffer where a command lies contiguous, publishing head per
+ * command.  The ring thread calls this; exposed for the decode test. */
+bool
+npt_ring_decode_available(struct npt_ring *ring, uint32_t tail);
+
 /* The ring whose thread is decoding `dispatch` (a copy of the context
  * dispatch rebound to that ring's CS pair). */
 static inline struct npt_ring *
