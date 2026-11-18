@@ -6,6 +6,7 @@
 #include "render_context.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -866,12 +867,10 @@ render_context_init_name(struct render_context *ctx,
 /* Watch the VMM through a kqueue so a dead or closing peer can never
  * strand the parked ring consumers: EVFILT_PROC NOTE_EXIT on the parent
  * and EVFILT_READ EV_EOF on the context socket both become a stop
- * request plus a semaphore signal.  Stray socket data while the main
- * consumer is parked on an empty ring is a protocol violation: the VMM
- * always publishes a SOCKET_REQUEST marker before socket bytes, and a
- * published marker makes the ring non-empty while a consumed marker is
- * being serviced with the consumer state still ACTIVE/WAKING -- so
- * SLEEPING + empty ring + readable data can only be stray. */
+ * request plus a semaphore signal.  Socket data is the main consumer's
+ * business: the read filter's low-water mark keeps ordinary requests from
+ * waking this thread, and a byte-count snapshot taken here could not be
+ * ordered against the consumer anyway. */
 static int
 render_context_watcher_thread(void *arg)
 {
@@ -901,22 +900,6 @@ render_context_watcher_thread(void *arg)
             reason = 1;
             break;
          }
-         /* ev.data is the pending byte count: stray socket data while
-          * the main consumer is parked on an empty ring is a protocol
-          * violation (a SOCKET_REQUEST marker would keep the ring
-          * non-empty, and a consumed marker being serviced leaves the
-          * consumer state ACTIVE/WAKING) */
-         if (ev.data > 0 && ctx->ring &&
-             atomic_load_explicit(&ctx->ring->main_state.value,
-                                  memory_order_acquire) == RENDER_RING_SLEEPING &&
-             !render_ring_has_entries(
-                &ctx->main_ring,
-                atomic_load_explicit(ctx->main_ring.head,
-                                     memory_order_acquire))) {
-            render_log("context socket: unexpected data; terminating");
-            reason = 2;
-            break;
-         }
       }
    }
 
@@ -941,8 +924,8 @@ render_context_watcher_start(struct render_context *ctx)
    struct kevent kev[3];
    EV_SET(&kev[0], getppid(), EVFILT_PROC, EV_ADD | EV_ENABLE, NOTE_EXIT, 0,
           NULL);
-   EV_SET(&kev[1], ctx->socket.fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
-          NULL);
+   EV_SET(&kev[1], ctx->socket.fd, EVFILT_READ, EV_ADD | EV_CLEAR, NOTE_LOWAT,
+          INT_MAX, NULL);
    EV_SET(&kev[2], 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
    if (kevent(ctx->watcher_kq, kev, ARRAY_SIZE(kev), NULL, 0, NULL)) {
       /* ESRCH: the VMM already exited */

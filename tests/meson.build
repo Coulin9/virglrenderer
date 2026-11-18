@@ -43,6 +43,11 @@ if host_machine.system() == 'darwin'
       include_directories : include_directories(
          '..', '../src', '../src/mesa/compat'))
    test('test_proxy_monitor', test_proxy_monitor)
+
+   test_socket_watcher = executable(
+      'test_socket_watcher',
+      'test_socket_watcher.c')
+   test('test_socket_watcher', test_socket_watcher)
 endif
 
 test_npt_doorbell = executable(
