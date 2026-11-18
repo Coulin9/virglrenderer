@@ -16,6 +16,8 @@ struct virgl_context;
 
 struct proxy_renderer_cbs {
    int (*get_server_fd)(uint32_t version);
+   /* NULL when the client provides no context_irq callback */
+   void (*context_irq)(uint32_t ctx_id);
 };
 
 #ifdef ENABLE_RENDER_SERVER

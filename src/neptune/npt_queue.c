@@ -78,6 +78,7 @@ npt_queue_alloc_sync(uint32_t ring_idx,
    sync->release_proxy = paired->release_proxy;
    sync->check_fence = paired->check_fence;
    sync->check_value = paired->check_value;
+   sync->queue_mode = paired->queue_mode;
    sync->fast_poll = false;
    sync->deadline_ns = npt_profile_now_ns() +
       (uint64_t)NPT_QUEUE_DEVICE_LOST_SEC * 1000000000ull;
@@ -93,8 +94,14 @@ npt_queue_free_sync(struct npt_queue_sync *sync)
    free(sync);
 }
 
+/* `lost` marks a retirement that wasn't a genuine completion: the
+ * device-lost deadline, a dead wait fd, worker death or teardown.  On
+ * that path queue-mode entries must NOT publish their token (no
+ * completion happened) -- the guest learns via the status page's lost
+ * word; the entry only releases its proxies. */
 static inline void
-npt_queue_sync_retire(struct npt_queue *queue, struct npt_queue_sync *sync)
+npt_queue_sync_retire(struct npt_queue *queue, struct npt_queue_sync *sync,
+                      bool lost)
 {
    /* Publish each armed fence's freshest completed value into its
     * feedback slot before the guest can observe the retirement. */
@@ -111,12 +118,34 @@ npt_queue_sync_retire(struct npt_queue *queue, struct npt_queue_sync *sync)
       free(fences);
    }
 
-   queue->context->retire_fence(queue->context->ctx_id,
+   /* ARM_QUEUE retirement: the fence-value refresh above ran first;
+    * now publish the token to the completion queue before dropping the
+    * proxy, per the completion-path ordering. */
+   if (sync->queue_mode && !lost)
+      npt_event_queue_complete(queue->context, sync->release_proxy);
+
+   /* Queue arms carry no guest fence (fence_id == 0): there is nothing
+    * to retire back to the guest. */
+   if (!sync->queue_mode)
+      queue->context->retire_fence(queue->context->ctx_id,
                                  sync->ring_idx, sync->fence_id);
    /* The arm's proxy reference was transferred to this entry at
     * pairing; the fence has retired (the proxy fired), so the D3D
-    * library is done writing the signal handle -- release it. */
+    * library is done writing the signal handle -- release it.  Queue
+    * arms also drop the registration reference here: the guest sends
+    * no RELEASE_EVENT for queue arms and the host retires the token
+    * itself. */
+   const uint64_t queue_token =
+      (sync->queue_mode && sync->release_proxy)
+         ? sync->release_proxy->token
+         : 0;
    npt_event_release_proxy(queue->context, sync->release_proxy);
+   if (sync->queue_mode) {
+      npt_event_release_registration(queue->context, queue_token,
+                                     sync->release_proxy);
+      if (!lost)
+         npt_event_queue_irq(queue->context);
+   }
    if (sync->check_fence)
       npt_d3d12_gate_release(sync->check_fence);
    npt_queue_free_sync(sync);
@@ -214,8 +243,27 @@ npt_queue_thread(void *arg)
 
    mtx_lock(&queue->sync_thread.mutex);
    while (true) {
-      while (list_is_empty(&queue->sync_thread.syncs) && !queue->sync_thread.join)
-         cnd_wait(&queue->sync_thread.cond, &queue->sync_thread.mutex);
+      while (list_is_empty(&queue->sync_thread.syncs) && !queue->sync_thread.join) {
+         if (!ctx->status_page ||
+             !npt_completion_has_overflow(&ctx->evt_producer)) {
+            cnd_wait(&queue->sync_thread.cond, &queue->sync_thread.mutex);
+            continue;
+         }
+         mtx_unlock(&queue->sync_thread.mutex);
+         if (npt_completion_flush(&ctx->evt_producer, ctx->status_page))
+            npt_event_queue_irq(ctx);
+         mtx_lock(&queue->sync_thread.mutex);
+         if (!npt_completion_has_overflow(&ctx->evt_producer))
+            continue;
+         struct timespec ts;
+         timespec_get(&ts, TIME_UTC);
+         ts.tv_nsec += 1000000;
+         if (ts.tv_nsec >= 1000000000) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000;
+         }
+         cnd_timedwait(&queue->sync_thread.cond, &queue->sync_thread.mutex, &ts);
+      }
 
       if (queue->sync_thread.join)
          break;
@@ -225,6 +273,17 @@ npt_queue_thread(void *arg)
 
       mtx_unlock(&queue->sync_thread.mutex);
 
+      /* Overflowed completion tokens wait for guest head space; this
+       * thread's poll cycle is the periodic per-context hook that
+       * retries them, so shrink the wait to 1 ms while the FIFO is
+       * non-empty. */
+      if (npt_completion_has_overflow(&ctx->evt_producer) &&
+          ctx->status_page &&
+          npt_completion_flush(&ctx->evt_producer, ctx->status_page))
+         npt_event_queue_irq(ctx);
+      const bool ovf_pending =
+         npt_completion_has_overflow(&ctx->evt_producer);
+
       struct timespec t0, t1;
       const bool trace = NPT_DEBUG(FENCE_TRACE);
       if (trace) {
@@ -232,6 +291,7 @@ npt_queue_thread(void *arg)
          t1 = t0;
       }
       int rc = 0;
+      bool fired = false;
 
       if (sync->check_fence) {
          /* The event is only a wakeup source; the value is the truth.
@@ -244,9 +304,11 @@ npt_queue_thread(void *arg)
             goto retire;
          }
 
-         rc = npt_wait_sync_fd(sync->sync_fd,
-                               sync->fast_poll ? kGateFastPollMs
-                                               : kGatePollTimeoutMs);
+         int gate_timeout = sync->fast_poll ? kGateFastPollMs
+                                            : kGatePollTimeoutMs;
+         if (ovf_pending && gate_timeout > 1)
+            gate_timeout = 1;
+         rc = npt_wait_sync_fd(sync->sync_fd, gate_timeout);
 
          bool stale = false;
          if (rc > 0 && npt_queue_drain_wakeups(sync->sync_fd)) {
@@ -270,7 +332,8 @@ npt_queue_thread(void *arg)
          goto retire;
       }
 
-      rc = npt_wait_sync_fd(sync->sync_fd, kPollTimeoutMs);
+      rc = npt_wait_sync_fd(sync->sync_fd,
+                            ovf_pending ? 1 : kPollTimeoutMs);
       if (trace)
          clock_gettime(CLOCK_MONOTONIC, &t1);
 
@@ -278,9 +341,11 @@ npt_queue_thread(void *arg)
        * event is manual-reset and nothing else drains its exported
        * pipe.  Each guest arm gets its own proxy, so a leftover token
        * can no longer retire a later fence; draining keeps the proxy's
-       * descriptor quiet for whatever still polls it. */
+       * descriptor quiet for whatever still polls it.  A readable fd
+       * that yields no token is a dead fd (POLLERR/HUP or a racing
+       * close), which for a queue arm is a loss, not a fire. */
       if (rc > 0)
-         npt_queue_drain_wakeups(sync->sync_fd);
+         fired = npt_queue_drain_wakeups(sync->sync_fd);
 
       mtx_lock(&queue->sync_thread.mutex);
 
@@ -306,7 +371,8 @@ retire:;
       }
 
       list_del(&sync->head);
-      npt_queue_sync_retire(queue, sync);
+      const bool lost = sync->queue_mode && (rc == 0 || !fired);
+      npt_queue_sync_retire(queue, sync, lost);
    }
    mtx_unlock(&queue->sync_thread.mutex);
 
@@ -363,7 +429,7 @@ npt_queue_sync_thread_fini(struct npt_queue *queue)
    list_for_each_entry_safe (struct npt_queue_sync, sync,
                              &queue->sync_thread.syncs, head) {
       list_del(&sync->head);
-      npt_queue_sync_retire(queue, sync);
+      npt_queue_sync_retire(queue, sync, /*lost=*/true);
       leftover++;
    }
    if (leftover)

@@ -169,6 +169,26 @@ if with_neptune
                        dependencies : neptune_test_depends)
       test(t[0], exe, env : neptune_test_env)
    endforeach
+
+   test_npt_completion = executable(
+      'test_npt_completion',
+      ['test_npt_completion.c', '../src/neptune/npt_completion.c'],
+      include_directories : include_directories(
+         '..', '../src', '../src/mesa', '../src/mesa/compat',
+         '../src/neptune', '../src/gallium/auxiliary',
+         '../src/gallium/include'))
+   test('test_npt_completion', test_npt_completion)
+
+   test_npt_queue_mode = executable(
+      'test_npt_queue_mode',
+      ['test_npt_queue_mode.c', '../src/neptune/npt_event.c',
+       '../src/neptune/npt_queue.c', '../src/neptune/npt_completion.c'],
+      include_directories : include_directories(
+         '..', '../src', '../src/mesa', '../src/mesa/compat',
+         '../src/neptune', '../src/gallium/auxiliary',
+         '../src/gallium/include',
+         '../subprojects/directx-native/include'))
+   test('test_npt_queue_mode', test_npt_queue_mode)
 endif
 
 if with_venus

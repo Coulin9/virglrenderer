@@ -9,6 +9,7 @@
 #define NPT_CONTEXT_H
 
 #include "npt_common.h"
+#include "npt_completion.h"
 #include "npt_cs.h"
 #include "npt_event.h"
 #include "npt_feedback.h"
@@ -235,6 +236,16 @@ struct npt_context {
     * miss would complete the guest's wait before the GPU work ran, and
     * leave the arm to mispair with the ring's next fence. */
    struct list_head      event_pending_fences;
+
+   /* Completion queue (context status page v2): the page shared with
+    * the VMM and the guest, the VMM-side wake signalled when a guest
+    * waiter needs an interrupt, and the producer state.  Set once by
+    * npt_renderer_set_status_page after INIT delivers the fd; NULL
+    * until then and on hosts without the page. */
+   struct npt_context_status_page *status_page;
+   void (*status_wake)(void *opaque);
+   void *status_wake_opaque;
+   struct npt_completion_producer evt_producer;
 
    /* Per-object shmem slots (queries, fences, ...) the dispatch
     * thread writes when host state advances, so the guest reads

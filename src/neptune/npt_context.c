@@ -1682,24 +1682,40 @@ npt_context_pair_event_fence(struct npt_context *ctx,
          mtx_unlock(&ctx->sync_queues_mutex);
          npt_log("pair_event_fence: failed to create sync queue for "
                  "ring_idx %u", ring_idx);
+         const uint64_t queue_token =
+            (paired->queue_mode && paired->release_proxy)
+               ? paired->release_proxy->token : 0;
          close(sync_fd);
          npt_event_release_proxy(ctx, paired->release_proxy);
+         if (paired->queue_mode)
+            npt_event_release_registration(ctx, queue_token,
+                                           paired->release_proxy);
          if (paired->check_fence)
             npt_d3d12_gate_release(paired->check_fence);
-         ctx->retire_fence(ctx->ctx_id, ring_idx, fence_id);
+         if (!paired->queue_mode)
+            ctx->retire_fence(ctx->ctx_id, ring_idx, fence_id);
          return true;
       }
       ctx->sync_queues[ring_idx] = queue;
    }
    mtx_unlock(&ctx->sync_queues_mutex);
 
+   const uint64_t queue_token =
+      (paired->queue_mode && paired->release_proxy)
+         ? paired->release_proxy->token : 0;
    if (!npt_queue_sync_submit(queue, ring_idx, fence_id, paired)) {
       /* The submit released the paired wait source, so nothing is left
        * that could ever retire this fence.  Retiring early is wrong;
-       * leaving the guest's wait outstanding for good is worse. */
+       * leaving the guest's wait outstanding for good is worse.  Queue
+       * arms carry no guest fence: just drop the registration the guest
+       * will never release. */
       npt_log("pair_event_fence: sync submit failed (ring=%u id=%" PRIu64
               ") -- retiring EARLY", ring_idx, fence_id);
-      ctx->retire_fence(ctx->ctx_id, ring_idx, fence_id);
+      if (paired->queue_mode)
+         npt_event_release_registration(ctx, queue_token,
+                                        paired->release_proxy);
+      else
+         ctx->retire_fence(ctx->ctx_id, ring_idx, fence_id);
       return false;
    }
 

@@ -284,6 +284,23 @@ npt_renderer_set_work_context(uint32_t ctx_id,
 }
 
 void
+npt_renderer_set_status_page(uint32_t ctx_id,
+                             struct npt_context_status_page *page,
+                             npt_status_wake_fn wake, void *wake_opaque)
+{
+   struct npt_context *ctx = npt_renderer_lookup_context(ctx_id);
+   if (!ctx || ctx->status_page)
+      return;
+   ctx->status_page = page;
+   ctx->status_wake = wake;
+   ctx->status_wake_opaque = wake_opaque;
+   /* normally 0 (the page is fresh); adopt the shared tail in case a
+    * restarted context re-attaches */
+   ctx->evt_producer.tail =
+      atomic_load_explicit(&page->evt_tail, memory_order_acquire);
+}
+
+void
 npt_renderer_destroy_context(uint32_t ctx_id)
 {
    struct npt_context *ctx = npt_renderer_lookup_context(ctx_id);

@@ -17,6 +17,8 @@
 
 #include "npt_protocol_defs.h"
 
+#include <stddef.h>
+
 #define NPT_TRANSPORT_GROUP 0u
 
 /* Subgroup ids -- bits 23:16 of cmd_type. */
@@ -516,6 +518,7 @@ struct npt_cmd_shared_open_res_reply {
 #define NPT_TRANSPORT_EVENT_ARM_FENCE 1u
 #define NPT_TRANSPORT_EVENT_RELEASE   2u
 #define NPT_TRANSPORT_EVENT_GATE_WAIT 3u
+#define NPT_TRANSPORT_EVENT_ARM_QUEUE 4u
 
 /* Token = (uintptr_t) of the guest-side HANDLE. */
 struct npt_cmd_register_event {
@@ -541,6 +544,19 @@ struct npt_cmd_arm_event_fence_reply {
 struct npt_cmd_release_event {
    struct npt_command_header header;
    uint64_t event_token;
+};
+
+/* Async, no reply: pairs the token's host event proxy with the next
+ * submit_fence on ring_idx exactly like ARM_EVENT_FENCE, but on
+ * retirement the host publishes the token into the context status
+ * page's completion queue instead of the guest waiting on a
+ * KMD-signalled fd.  ring_idx is required because pending arms pair
+ * per-ring (see npt_cmd_arm_event_fence). */
+struct npt_cmd_arm_event_queue {
+   struct npt_command_header header;
+   uint64_t event_token;
+   uint32_t ring_idx;
+   uint32_t pad;
 };
 
 /* Synchronous: monitored-fence gate wait (D3D12 DDI path).  The host
@@ -649,18 +665,59 @@ struct npt_d3d11_fence_feedback_slot {
 };
 
 #define NPT_CONTEXT_STATUS_BLOB_ID   UINT64_C(0xFFFFFFFFFFFFFF01)
-#define NPT_CONTEXT_STATUS_PAGE_SIZE 16384u
+#define NPT_CONTEXT_STATUS_PAGE_SIZE 65536u
 #define NPT_CONTEXT_STATUS_MAGIC     0x5354504eu
-#define NPT_CONTEXT_STATUS_VERSION   1u
+#define NPT_CONTEXT_STATUS_VERSION   2u
 #define NPT_CONTEXT_STATUS_LOST_WORKER_EXIT 1u
 
+/* Single-producer / single-consumer token queue used for Win32 event
+ * completion.  Each field lives on its own cache line and has exactly
+ * one writer: the first 128 bytes are VMM-written, evt_tail and
+ * evt_tokens are worker-written, evt_head and guest_waiters are
+ * guest-written, and irq_pending is worker-set / VMM-exchanged. */
+#define NPT_COMPLETION_QUEUE_SIZE 4096u /* power of two */
+
 struct npt_context_status_page {
+   /* line 0 @0: existing header, VMM-written */
    uint32_t magic;
    uint32_t version;
    _Atomic uint32_t lost;
    uint32_t pad0;
    _Atomic uint64_t lost_ns;
+   uint8_t pad1[128 - 24];
+
+   /* line 1 @128: worker-written producer tail */
+   _Atomic uint64_t evt_tail;
+   uint8_t pad2[128 - 8];
+
+   /* line 2 @256: guest-written consumer head + waiter count */
+   _Atomic uint64_t evt_head;
+   _Atomic uint32_t guest_waiters;
+   uint8_t pad3[128 - 12];
+
+   /* line 3 @384: worker stores 1, VMM exchanges to 0 */
+   _Atomic uint32_t irq_pending;
+   uint8_t pad4[128 - 4];
+
+   uint8_t pad5[4096 - 512];
+
+   /* @4096: worker-written token slots */
+   _Atomic uint64_t evt_tokens[NPT_COMPLETION_QUEUE_SIZE];
 };
+
+_Static_assert(offsetof(struct npt_context_status_page, evt_tail) == 128,
+               "evt_tail offset");
+_Static_assert(offsetof(struct npt_context_status_page, evt_head) == 256,
+               "evt_head offset");
+_Static_assert(offsetof(struct npt_context_status_page, guest_waiters) == 264,
+               "guest_waiters offset");
+_Static_assert(offsetof(struct npt_context_status_page, irq_pending) == 384,
+               "irq_pending offset");
+_Static_assert(offsetof(struct npt_context_status_page, evt_tokens) == 4096,
+               "evt_tokens offset");
+_Static_assert(sizeof(struct npt_context_status_page) <=
+                  NPT_CONTEXT_STATUS_PAGE_SIZE,
+               "status page size");
 
 struct npt_cmd_register_fence_feedback {
    struct npt_command_header header;

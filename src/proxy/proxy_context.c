@@ -269,6 +269,19 @@ proxy_context_sync_has_work(void *opaque)
    return false;
 }
 
+/* The worker asks for a guest interrupt by setting irq_pending; the
+ * sync thread clears it and forwards one config-change interrupt per
+ * set.  Runs on every wake, not only on the completion ring. */
+static void
+proxy_context_poll_irq(struct proxy_context *ctx)
+{
+   struct npt_context_status_page *page =
+      atomic_load_explicit(&ctx->status_page, memory_order_acquire);
+   if (page && atomic_exchange(&page->irq_pending, 0) &&
+       proxy_renderer.cbs->context_irq)
+      proxy_renderer.cbs->context_irq(ctx->base.ctx_id);
+}
+
 static int
 proxy_context_sync_thread(void *arg)
 {
@@ -280,6 +293,7 @@ proxy_context_sync_thread(void *arg)
       ctx->ring ? &ctx->ring->stats_vmm.v.vmm_sleeps : NULL;
 
    while (!ctx->sync_thread.stop) {
+      proxy_context_poll_irq(ctx);
       proxy_context_retire_fences_internal(ctx);
       if (ctx->sync_thread.stop)
          break;
@@ -1297,6 +1311,25 @@ proxy_context_init(struct proxy_context *ctx, uint32_t ctx_flags)
       return false;
    }
 
+   /* Neptune contexts get their status page eagerly: the completion
+    * queue lives there, the worker needs the fd in INIT, and the
+    * guest-visible blob must export this same shm. */
+   if (ctx->has_oob_ring) {
+      struct npt_context_status_page *page =
+         proxy_context_status_page_create(ctx);
+      if (!page) {
+         proxy_log("failed to create status page for ctx %d",
+                   ctx->base.ctx_id);
+         return false;
+      }
+      atomic_store_explicit(&ctx->status_page, page, memory_order_seq_cst);
+      /* pairs with the death path: either it sees this page, or we see
+       * its worker_dead store */
+      if (atomic_load_explicit(&ctx->worker_dead, memory_order_seq_cst))
+         proxy_status_page_mark_lost(page, NPT_CONTEXT_STATUS_LOST_WORKER_EXIT,
+                                     render_ring_now_ns());
+   }
+
    struct render_ring_layout layout;
    render_ring_layout_compute(&layout, ctx->has_oob_ring,
                               ctx->lat_trace_enabled);
@@ -1324,22 +1357,23 @@ proxy_context_init(struct proxy_context *ctx, uint32_t ctx_flags)
       .work_context = ctx->work_context_config,
    };
 #if defined(__APPLE__)
-   /* INIT carries only the ring shmem: the wake semaphores were handed
-    * over at spawn as registered ports and there is no death pipe. */
-   const int req_fds[] = { ctx->shmem.fd };
+   /* INIT carries the ring shmem fd plus (Neptune only) the status
+    * page fd: the wake semaphores were handed over at spawn as
+    * registered ports and there is no death pipe. */
+   const int req_fds[2] = { ctx->shmem.fd, ctx->status_fd };
+   const int req_fd_count = ctx->has_oob_ring ? 2 : 1;
 #else
-   const int req_fds[5] = {
-      ctx->shmem.fd,
-      ctx->ring_fds.completion_write,
-      ctx->ring_fds.main_wake_read,
-      ctx->ring_fds.death_write,
-      ctx->ring_fds.oob_wake_read,
-   };
-#endif
-#if defined(__APPLE__)
-   const int req_fd_count = 1;
-#else
-   const int req_fd_count = ctx->has_oob_ring ? 5 : 4;
+   int req_fds[6];
+   int req_fd_count = 0;
+   req_fds[req_fd_count++] = ctx->shmem.fd;
+   req_fds[req_fd_count++] = ctx->ring_fds.completion_write;
+   req_fds[req_fd_count++] = ctx->ring_fds.main_wake_read;
+   req_fds[req_fd_count++] = ctx->ring_fds.death_write;
+   if (ctx->has_oob_ring)
+      req_fds[req_fd_count++] = ctx->ring_fds.oob_wake_read;
+   /* the status page fd travels last when the context has one */
+   if (ctx->status_fd >= 0)
+      req_fds[req_fd_count++] = ctx->status_fd;
 #endif
    if (!proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req), req_fds,
                                            req_fd_count)) {

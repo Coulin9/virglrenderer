@@ -37,6 +37,9 @@ struct npt_queue_sync {
     * an IUnknown reference released at retirement. */
    void *check_fence;
    uint64_t check_value;
+   /* ARM_QUEUE arms: retirement publishes the proxy's token into the
+    * completion queue and drops both proxy references. */
+   bool queue_mode;
    /* Out-of-order wakeup observed: switch to short-period polling so a
     * fire consumed by an earlier gate on the same ring can't stall this
     * one for a full poll period. */

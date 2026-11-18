@@ -58,6 +58,18 @@ void
 npt_renderer_set_work_context(uint32_t ctx_id,
                               const struct npt_work_context_config *config);
 
+struct npt_context_status_page;
+typedef void (*npt_status_wake_fn)(void *opaque);
+
+/* Called once at INIT with the context status page mapping and a wake
+ * that reaches the VMM's fence sync thread (render_wake_signal on the
+ * worker side).  The page carries the completion queue, the lost flag
+ * and irq_pending. */
+void
+npt_renderer_set_status_page(uint32_t ctx_id,
+                             struct npt_context_status_page *page,
+                             npt_status_wake_fn wake, void *wake_opaque);
+
 bool
 npt_renderer_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size);
 

@@ -76,6 +76,7 @@ struct npt_event_paired {
    struct npt_event_proxy *release_proxy;
    void    *check_fence;    /* value-gated retirement (or NULL) */
    uint64_t check_value;
+   bool     queue_mode;     /* publish token to the completion queue */
 };
 
 /* A fence that outran its ARM_EVENT_FENCE (independent channels on the
@@ -96,6 +97,30 @@ void npt_event_register(struct npt_context *ctx, uint64_t token);
 /* False if token isn't registered or dup/alloc fails. */
 bool npt_event_arm(struct npt_context *ctx, uint64_t token,
                     uint32_t ring_idx);
+
+/* ARM_QUEUE: pairs the proxy's wait fd straight into the ring's sync
+ * queue -- the guest sends no execbuffer or fence, so nothing is parked
+ * or pended.  Retirement publishes the token to the completion queue
+ * instead of a guest-side fd wait. */
+bool npt_event_arm_queue(struct npt_context *ctx, uint64_t token,
+                         uint32_t ring_idx);
+
+/* Queue-mode retirement: publish the proxy's token into the status
+ * page's completion queue (fence-value refresh already ran in the
+ * caller), then request at most one guest interrupt when waiters
+ * exist.  The proxy references are dropped by the caller between the
+ * two: publish first, then release_proxy (arm + registration refs),
+ * then npt_event_queue_irq. */
+void npt_event_queue_complete(struct npt_context *ctx,
+                              struct npt_event_proxy *pr);
+void npt_event_queue_irq(struct npt_context *ctx);
+
+/* Queue-mode retirement: drop the guest's registration reference on
+ * `pr` (keyed by `token`, read before the arm reference was released),
+ * but only when this exact proxy is still the table entry. */
+void npt_event_release_registration(struct npt_context *ctx,
+                                    uint64_t token,
+                                    struct npt_event_proxy *pr);
 
 void npt_event_release(struct npt_context *ctx, uint64_t token);
 

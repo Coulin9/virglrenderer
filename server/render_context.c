@@ -23,8 +23,10 @@
 
 #include "render_socket.h"
 #include "render_state.h"
+#include "virtgpu_drm.h"
 #ifdef ENABLE_NEPTUNE
 #include "npt_renderer.h"
+#include "neptune-protocol/npt_protocol_transport.h"
 #endif
 
 /* Resolve the VMM fence_id for a dequeued fence entry through the
@@ -297,6 +299,17 @@ render_context_dispatch_create_resource(struct render_context *ctx,
    return ok;
 }
 
+/* Bridge from the Neptune context to the completion wake without
+ * exposing render internals: npt_completion code calls this when a
+ * guest waiter needs an interrupt injected. */
+static void
+render_context_status_wake(void *opaque)
+{
+   struct render_context *ctx = opaque;
+   if (ctx->completion_wake != RENDER_WAKE_NULL)
+      render_wake_signal(ctx->completion_wake);
+}
+
 static bool
 render_context_dispatch_init(struct render_context *ctx,
                              const union render_context_op_request *request,
@@ -310,12 +323,15 @@ render_context_dispatch_init(struct render_context *ctx,
 
    const struct render_context_op_init_request *req = &request->init;
    const bool has_oob = req->oob_ring_size != 0;
+   const bool has_status =
+      (req->flags & VIRGL_RENDERER_CONTEXT_FLAG_CAPSET_ID_MASK) ==
+      VIRTGPU_DRM_CAPSET_NEPTUNE;
 #if defined(__APPLE__)
    /* the wake semaphores arrive as registered ports at spawn; INIT
-    * carries only the ring shmem fd */
-   const int expected_fds = 1;
+    * carries only the ring shmem fd plus the status page on Neptune */
+   const int expected_fds = has_status ? 2 : 1;
 #else
-   const int expected_fds = has_oob ? 5 : 4;
+   const int expected_fds = (has_oob ? 5 : 4) + (has_status ? 1 : 0);
 #endif
    if (fd_count != expected_fds) {
       render_log("INIT: expected %d fds, got %d", expected_fds, fd_count);
@@ -349,6 +365,8 @@ render_context_dispatch_init(struct render_context *ctx,
    const int death_write_fd = fds[3];
    const int oob_wake_read = has_oob ? fds[4] : -1;
 #endif
+   /* the status page fd always travels last when present */
+   const int status_fd = has_status ? fds[expected_fds - 1] : -1;
 
    void *shmem_ptr =
       mmap(NULL, req->shmem_size, PROT_READ | PROT_WRITE, MAP_SHARED, shmem_fd, 0);
@@ -363,6 +381,29 @@ render_context_dispatch_init(struct render_context *ctx,
 #ifdef ENABLE_NEPTUNE
    if (ctx->backend == RENDER_BACKEND_NEPTUNE)
       npt_renderer_set_work_context(ctx->ctx_id, &req->work_context);
+#endif
+
+#ifdef ENABLE_NEPTUNE
+   if (status_fd >= 0) {
+      void *status_ptr = mmap(NULL, NPT_CONTEXT_STATUS_PAGE_SIZE,
+                              PROT_READ | PROT_WRITE, MAP_SHARED, status_fd,
+                              0);
+      if (status_ptr == MAP_FAILED ||
+          ((struct npt_context_status_page *)status_ptr)->magic !=
+             NPT_CONTEXT_STATUS_MAGIC) {
+         render_log("INIT: status page mapping failed");
+         if (status_ptr != MAP_FAILED)
+            munmap(status_ptr, NPT_CONTEXT_STATUS_PAGE_SIZE);
+         close(status_fd);
+         munmap(shmem_ptr, req->shmem_size);
+         return false;
+      }
+      ctx->status_fd = status_fd;
+      ctx->status_ptr = status_ptr;
+      if (ctx->backend == RENDER_BACKEND_NEPTUNE)
+         npt_renderer_set_status_page(ctx->ctx_id, ctx->status_ptr,
+                                      render_context_status_wake, ctx);
+   }
 #endif
 
    ctx->shmem_fd = shmem_fd;
@@ -695,6 +736,12 @@ render_context_fini(struct render_context *ctx)
    /* destroy the context first to join its sync threads and ring threads */
    render_state_destroy_context(ctx->ctx_id);
 
+#ifdef ENABLE_NEPTUNE
+   if (ctx->status_ptr)
+      munmap(ctx->status_ptr, NPT_CONTEXT_STATUS_PAGE_SIZE);
+#endif
+   if (ctx->status_fd >= 0)
+      close(ctx->status_fd);
    if (ctx->shmem_ptr)
       munmap(ctx->shmem_ptr, ctx->shmem_size);
    if (ctx->shmem_fd >= 0)
@@ -940,6 +987,7 @@ render_context_init(struct render_context *ctx, const struct render_context_args
    ctx->ctx_id = args->ctx_id;
    render_socket_init(&ctx->socket, args->ctx_fd);
    ctx->shmem_fd = -1;
+   ctx->status_fd = -1;
    ctx->completion_wake = RENDER_WAKE_NULL;
    ctx->main_wake = RENDER_WAKE_NULL;
    ctx->oob_wake = RENDER_WAKE_NULL;

@@ -318,6 +318,25 @@ npt_dispatch_arm_event_fence(struct npt_context *ctx,
    }
 }
 
+/* ARM_QUEUE: async, no reply -- retirement publishes the token into the
+ * status page's completion queue. */
+static void
+npt_dispatch_arm_event_queue(struct npt_context *ctx,
+                             struct npt_cs_decoder *dec,
+                             UNUSED struct npt_cs_encoder *enc,
+                             const struct npt_command_header *header)
+{
+   struct npt_cmd_arm_event_queue cmd;
+   cmd.header = *header;
+   npt_cs_decoder_read(dec, sizeof(cmd) - sizeof(cmd.header),
+                       &cmd.event_token, sizeof(cmd) - sizeof(cmd.header));
+   if (npt_cs_decoder_get_fatal(dec))
+      return;
+
+   if (!npt_event_arm_queue(ctx, cmd.event_token, cmd.ring_idx))
+      npt_event_drain_parked_ring(ctx, cmd.ring_idx);
+}
+
 static void
 npt_dispatch_release_event(struct npt_context *ctx,
                            struct npt_cs_decoder *dec,
@@ -802,6 +821,9 @@ npt_dispatch_subgroup_event(struct npt_context *ctx,
       return true;
    case NPT_TRANSPORT_EVENT_ARM_FENCE:
       npt_dispatch_arm_event_fence(ctx, dec, enc, header);
+      return true;
+   case NPT_TRANSPORT_EVENT_ARM_QUEUE:
+      npt_dispatch_arm_event_queue(ctx, dec, enc, header);
       return true;
    case NPT_TRANSPORT_EVENT_GATE_WAIT:
       npt_dispatch_gate_wait(ctx, dec, enc, header);

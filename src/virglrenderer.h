@@ -48,7 +48,7 @@ struct virgl_renderer_gl_ctx_param {
    int compat_ctx;
 };
 
-#define VIRGL_RENDERER_CALLBACKS_VERSION 4
+#define VIRGL_RENDERER_CALLBACKS_VERSION 5
 
 struct virgl_renderer_callbacks {
    int version;
@@ -104,6 +104,15 @@ struct virgl_renderer_callbacks {
     * destroy_gl_context, make_current to be implemented by caller.
     */
    void *(*get_egl_display)(void *cookie);
+
+   /*
+    * v5: Request a virtio-gpu config-change interrupt for ctx_id.  Called
+    * from the context's fence sync thread when the worker sets
+    * irq_pending in the context status page (the guest asked for a
+    * completion-queue interrupt).  Not a fence retirement; the caller
+    * may inject the interrupt unconditionally.
+    */
+   void (*context_irq)(void *cookie, uint32_t ctx_id);
 };
 
 /* virtio-gpu compatible interface */

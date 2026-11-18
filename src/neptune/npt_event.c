@@ -193,6 +193,7 @@ npt_event_init(struct npt_context *ctx)
 
    list_inithead(&ctx->event_pending_arms);
    list_inithead(&ctx->event_pending_fences);
+   npt_completion_producer_init(&ctx->evt_producer);
    for (unsigned i = 0; i < ARRAY_SIZE(ctx->gate_ring); i++)
       event_fd_init_invalid(&ctx->gate_ring[i]);
    return true;
@@ -263,6 +264,8 @@ npt_event_fini(struct npt_context *ctx)
 
    mtx_unlock(&ctx->event_mutex);
    mtx_destroy(&ctx->event_mutex);
+
+   npt_completion_producer_fini(&ctx->evt_producer);
 }
 
 static struct npt_event_proxy *
@@ -362,8 +365,9 @@ event_pair_parked(struct npt_context *ctx,
               ring_idx, fence_id);
 }
 
-bool
-npt_event_arm(struct npt_context *ctx, uint64_t token, uint32_t ring_idx)
+static bool
+npt_event_arm_mode(struct npt_context *ctx, uint64_t token,
+                   uint32_t ring_idx)
 {
    if (!token)
       return false;
@@ -429,6 +433,88 @@ npt_event_arm(struct npt_context *ctx, uint64_t token, uint32_t ring_idx)
 
    mtx_unlock(&ctx->event_mutex);
    return true;
+}
+
+bool
+npt_event_arm(struct npt_context *ctx, uint64_t token, uint32_t ring_idx)
+{
+   return npt_event_arm_mode(ctx, token, ring_idx);
+}
+
+/* ARM_QUEUE pairs the proxy's wait fd straight into the ring's sync
+ * queue: the guest sends no execbuffer or fence for queue arms, so
+ * there is nothing to wait for on the pending-arm list and no parked
+ * fence to consume.  Never touch event_pending_arms or
+ * event_pending_fences here -- a parked fence belongs to an old-path or
+ * present arm on the same ring. */
+bool
+npt_event_arm_queue(struct npt_context *ctx, uint64_t token,
+                    uint32_t ring_idx)
+{
+   if (!token)
+      return false;
+
+   if (!ctx->status_page) {
+      npt_log("event: ARM_QUEUE with no status page (token %" PRIu64 ")",
+              token);
+      return false;
+   }
+
+   mtx_lock(&ctx->event_mutex);
+   struct npt_event_proxy *pr = lookup_locked(ctx, token);
+   if (!pr) {
+      pr = event_proxy_create_locked(ctx, token, /*initial_refcount=*/0);
+      if (!pr) {
+         mtx_unlock(&ctx->event_mutex);
+         return false;
+      }
+   }
+   /* Same arm reference as npt_event_arm: it moves to the sync-queue
+    * entry and is released after retirement. */
+   pr->refcount++;
+
+   int dup_fd = event_fd_dup_wait_fd(&pr->proxy);
+   if (dup_fd < 0) {
+      npt_log("event: dup(proxy wait fd) failed: %s", strerror(errno));
+      npt_event_proxy_unref_locked(ctx, pr, NULL);
+      mtx_unlock(&ctx->event_mutex);
+      return false;
+   }
+   mtx_unlock(&ctx->event_mutex);
+
+   const struct npt_event_paired paired = {
+      .fd = dup_fd,
+      .release_proxy = pr,
+      .queue_mode = true,
+   };
+   return npt_context_pair_event_fence(ctx, ring_idx, /*fence_id=*/0,
+                                       &paired);
+}
+
+/* Queue-mode retirement, in order: publish the token into the status
+ * page's completion queue (the P3a fence-value refresh has already run
+ * in npt_queue_sync_retire), drop BOTH the arm and registration proxy
+ * references -- the guest sends no RELEASE for queue arms -- then, if
+ * a guest waiter exists, ask the VMM for one interrupt. */
+void
+npt_event_queue_complete(struct npt_context *ctx,
+                         struct npt_event_proxy *pr)
+{
+   if (!pr || !ctx->status_page)
+      return;
+   const uint64_t token = pr->token;
+   if (!npt_completion_publish(&ctx->evt_producer, ctx->status_page,
+                               token))
+      npt_log("event: completion publish failed (token %" PRIu64 ")",
+              token);
+}
+
+void
+npt_event_queue_irq(struct npt_context *ctx)
+{
+   if (ctx->status_page && ctx->status_wake &&
+       npt_completion_maybe_irq(ctx->status_page))
+      ctx->status_wake(ctx->status_wake_opaque);
 }
 
 /* Caller holds ctx->event_mutex.  Passing `e` from an existing
@@ -536,6 +622,24 @@ npt_event_release_proxy(struct npt_context *ctx, struct npt_event_proxy *pr)
 
    mtx_lock(&ctx->event_mutex);
    npt_event_proxy_unref_locked(ctx, pr, NULL);
+   mtx_unlock(&ctx->event_mutex);
+}
+
+/* Queue-mode arms get no guest RELEASE_EVENT, so retirement drops the
+ * registration reference too.  Lookup by token proves the proxy is
+ * still the table entry: the arm reference may already have been the
+ * last one (lazy create), in which case the proxy is gone and there is
+ * nothing to drop. */
+void
+npt_event_release_registration(struct npt_context *ctx, uint64_t token,
+                               struct npt_event_proxy *pr)
+{
+   mtx_lock(&ctx->event_mutex);
+   struct hash_entry *e =
+      _mesa_hash_table_search_pre_hashed(ctx->event_proxies,
+                                         tok_hash(&token), &token);
+   if (e && e->data == pr)
+      npt_event_proxy_unref_locked(ctx, pr, e);
    mtx_unlock(&ctx->event_mutex);
 }
 

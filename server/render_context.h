@@ -14,6 +14,8 @@
 
 #include "render_ring.h"
 
+struct npt_context_status_page;
+
 enum render_backend_type {
    RENDER_BACKEND_NONE = 0,
    RENDER_BACKEND_VENUS,
@@ -31,6 +33,11 @@ struct render_context {
    int shmem_fd;
    size_t shmem_size;
    void *shmem_ptr;
+   /* Neptune only: context status page shared with the VMM and the
+    * guest (completion queue + lost flag).  fd/mapping owned here;
+    * handed to the Neptune context in INIT. */
+   int status_fd;
+   struct npt_context_status_page *status_ptr;
    struct render_ring_control *ring; /* == shmem_ptr */
    struct render_ring_buf main_ring;
    struct render_ring_oob oob_ring;

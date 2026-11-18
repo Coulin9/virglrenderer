@@ -109,6 +109,7 @@ venus_codegen = custom_target(
 
 neptune_sources = [
    'neptune/npt_common.c',
+   'neptune/npt_completion.c',
    'neptune/npt_context.c',
    'neptune/npt_cs.c',
    'neptune/npt_feedback.c',

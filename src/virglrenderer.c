@@ -755,8 +755,16 @@ proxy_renderer_cb_get_server_fd(uint32_t version)
       return -1;
 }
 
+static void
+proxy_renderer_cb_context_irq(uint32_t ctx_id)
+{
+   if (state.cbs && state.cbs->version >= 5 && state.cbs->context_irq)
+      state.cbs->context_irq(state.cookie, ctx_id);
+}
+
 static const struct proxy_renderer_cbs proxy_cbs = {
    proxy_renderer_cb_get_server_fd,
+   proxy_renderer_cb_context_irq,
 };
 
 void *virgl_renderer_get_cursor_data(uint32_t resource_id, uint32_t *width, uint32_t *height)
