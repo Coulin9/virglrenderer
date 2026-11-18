@@ -5,6 +5,7 @@
 
 #include "npt_event.h"
 
+#include "npt_com.h"
 #include "npt_context.h"
 #include "npt_library.h"
 #include "npt_renderer.h"
@@ -432,6 +433,8 @@ npt_event_arm(struct npt_context *ctx, uint64_t token, uint32_t ring_idx)
 
 /* Caller holds ctx->event_mutex.  Passing `e` from an existing
  * lookup avoids a re-search; NULL forces a fresh lookup. */
+static void event_seoc_release_all(void **fences, uint32_t count);
+
 static void
 npt_event_proxy_unref_locked(struct npt_context *ctx,
                               struct npt_event_proxy *pr,
@@ -441,6 +444,9 @@ npt_event_proxy_unref_locked(struct npt_context *ctx,
       return;
 
    event_fd_destroy(&pr->proxy);
+   event_seoc_release_all(pr->seoc_fences, pr->seoc_fence_count);
+   pr->seoc_fences = NULL;
+   pr->seoc_fence_count = 0;
 
    if (!e) {
       e = _mesa_hash_table_search_pre_hashed(ctx->event_proxies,
@@ -660,10 +666,15 @@ static _Thread_local struct {
    unsigned count;
 } event_cmd_pins;
 
+/* The proxy substituted most recently on this decode thread; read by
+ * the SetEventOnCompletion dispatch override between decode and
+ * unpin. */
+static _Thread_local struct npt_event_proxy *event_cmd_proxy;
+
 void
 npt_event_unpin_dispatched(struct npt_context *ctx)
 {
-   if (!event_cmd_pins.count)
+   if (!event_cmd_pins.count && !event_cmd_proxy)
       return;
 
    mtx_lock(&ctx->event_mutex);
@@ -671,6 +682,84 @@ npt_event_unpin_dispatched(struct npt_context *ctx)
       npt_event_proxy_unref_locked(ctx, event_cmd_pins.pr[i], NULL);
    mtx_unlock(&ctx->event_mutex);
    event_cmd_pins.count = 0;
+   event_cmd_proxy = NULL;
+}
+
+struct npt_event_proxy *
+npt_event_command_proxy(void)
+{
+   return event_cmd_proxy;
+}
+
+static void
+event_seoc_release_all(void **fences, uint32_t count)
+{
+   for (uint32_t i = 0; i < count; i++)
+      npt_com_release(fences[i]);
+   free(fences);
+}
+
+void
+npt_event_note_seoc_fences(struct npt_context *ctx,
+                           struct npt_event_proxy *pr,
+                           void *const *fences, uint32_t count)
+{
+   if (!pr)
+      return;
+
+   void **copy = NULL;
+   uint32_t n = 0;
+   if (count) {
+      copy = malloc(count * sizeof(*copy));
+      if (!copy) {
+         npt_log("event: seoc fence note: out of memory");
+         return;
+      }
+      for (uint32_t i = 0; i < count; i++) {
+         if (!fences[i])
+            continue;
+         npt_com_add_ref(fences[i]);
+         copy[n++] = fences[i];
+      }
+   }
+
+   mtx_lock(&ctx->event_mutex);
+   void **old = pr->seoc_fences;
+   const uint32_t old_count = pr->seoc_fence_count;
+   pr->seoc_fences = n ? copy : NULL;
+   pr->seoc_fence_count = n;
+   mtx_unlock(&ctx->event_mutex);
+
+   event_seoc_release_all(old, old_count);
+   if (!n)
+      free(copy);
+}
+
+void **
+npt_event_take_seoc_fences(struct npt_context *ctx,
+                           struct npt_event_proxy *pr,
+                           uint32_t *count)
+{
+   *count = 0;
+   if (!pr)
+      return NULL;
+
+   mtx_lock(&ctx->event_mutex);
+   void **fences = pr->seoc_fences;
+   *count = pr->seoc_fence_count;
+   pr->seoc_fences = NULL;
+   pr->seoc_fence_count = 0;
+   mtx_unlock(&ctx->event_mutex);
+   /* the proxy's IUnknown references move to the caller */
+   return fences;
+}
+
+void
+npt_event_drop_seoc_fences(struct npt_context *ctx, struct npt_event_proxy *pr)
+{
+   uint32_t count;
+   void **fences = npt_event_take_seoc_fences(ctx, pr, &count);
+   event_seoc_release_all(fences, count);
 }
 
 /* Out-of-line so npt_cs.h doesn't need npt_context.h (header cycle). */
@@ -689,6 +778,7 @@ npt_event_replace_by_token(struct npt_dispatch_context *dispatch,
    mtx_lock(&ctx->event_mutex);
    struct npt_event_proxy *pr = lookup_locked(ctx, token);
    void *ret = pr ? event_fd_signal_handle(&pr->proxy) : NULL;
+   event_cmd_proxy = pr;
    if (pr) {
       if (event_cmd_pins.count < NPT_EVENT_MAX_PINS_PER_CMD) {
          pr->refcount++;

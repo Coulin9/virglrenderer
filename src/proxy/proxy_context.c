@@ -5,8 +5,12 @@
 
 #include "proxy_context.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <stdio.h>
+#include <sched.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -52,13 +56,21 @@ static inline bool
 proxy_context_resource_table_init(struct proxy_context *ctx)
 {
    ctx->resource_table = _mesa_hash_table_create_u32_keys(NULL);
-   return ctx->resource_table;
+   ctx->status_resource_table = _mesa_hash_table_create_u32_keys(NULL);
+   return ctx->resource_table && ctx->status_resource_table;
 }
 
 static inline void
 proxy_context_resource_table_fini(struct proxy_context *ctx)
 {
    _mesa_hash_table_destroy(ctx->resource_table, NULL);
+   _mesa_hash_table_destroy(ctx->status_resource_table, NULL);
+}
+
+static inline bool
+proxy_context_status_resource_find(struct proxy_context *ctx, uint32_t res_id)
+{
+   return _mesa_hash_table_search(ctx->status_resource_table, (void *)(uintptr_t)res_id);
 }
 
 static bool
@@ -109,34 +121,43 @@ proxy_context_load_timeline_seqno(struct proxy_context *ctx, uint32_t ring_idx)
 static bool
 proxy_context_retire_timeline_fences_locked(struct proxy_context *ctx,
                                             uint32_t ring_idx,
-                                            uint32_t cur_seqno,
-                                            bool timed_out)
+                                            uint32_t cur_seqno)
 {
    struct proxy_timeline *timeline = &ctx->timelines[ring_idx];
-   bool force_retire_all = false;
+   /* once the death pipe fired, retire every fence whose fd will never
+    * signal instead of leaving a hung engine to the guest */
+   const bool force_retire_all =
+      atomic_load_explicit(&ctx->worker_dead, memory_order_acquire);
 
-   /* check if the socket has been disconnected (i.e., the other end has
-    * crashed) if no progress is made after a while -- or at once on a
-    * timed-out wake, which only happens when the worker has gone quiet
-    */
-   if (timeline->cur_seqno == cur_seqno && !list_is_empty(&timeline->fences)) {
-      timeline->cur_seqno_stall_count++;
-      if ((timeline->cur_seqno_stall_count < 100 && !timed_out) ||
-          proxy_socket_is_connected(&ctx->socket))
-         return false;
-
-      /* socket has been disconnected */
-      force_retire_all = true;
-   }
+   if (timeline->cur_seqno == cur_seqno && !list_is_empty(&timeline->fences) &&
+       !force_retire_all)
+      return false;
 
    timeline->cur_seqno = cur_seqno;
-   timeline->cur_seqno_stall_count = 0;
 
    list_for_each_entry_safe (struct proxy_fence, fence, &timeline->fences, head) {
       if (!proxy_fence_is_signaled(fence, timeline->cur_seqno) && !force_retire_all)
          return false;
 
+      struct render_ring_lat_rec *lat_rec = NULL;
+      uint64_t lat_cb_begin = 0;
+      if (ctx->lat) {
+         lat_rec = render_ring_lat_rec(ctx->lat, fence->fence_id);
+         if (atomic_load_explicit(&lat_rec->fence_id,
+                                  memory_order_acquire) != fence->fence_id)
+            lat_rec = NULL;
+         if (lat_rec) {
+            lat_rec->t_vmm_wake = ctx->lat_vmm_wake_ts;
+            lat_cb_begin = render_ring_now_ns();
+         }
+      }
+
       ctx->base.fence_retire(&ctx->base, ring_idx, fence->fence_id);
+
+      if (lat_rec) {
+         lat_rec->t_vmm_cb_begin = lat_cb_begin;
+         lat_rec->t_vmm_cb_end = render_ring_now_ns();
+      }
 
       /* The fence is done; drop the fd submit_fence registered for it (see
        * virgl_fence_retire).  Retirement here is driven by the timeline, not
@@ -152,7 +173,7 @@ proxy_context_retire_timeline_fences_locked(struct proxy_context *ctx,
 }
 
 static void
-proxy_context_retire_fences_internal(struct proxy_context *ctx, bool timed_out)
+proxy_context_retire_fences_internal(struct proxy_context *ctx)
 {
    if (ctx->sync_thread.fence_eventfd >= 0)
       flush_eventfd(ctx->sync_thread.fence_eventfd);
@@ -165,8 +186,7 @@ proxy_context_retire_fences_internal(struct proxy_context *ctx, bool timed_out)
    while (old_busy_mask) {
       const uint32_t ring_idx = u_bit_scan64(&old_busy_mask);
       const uint32_t cur_seqno = proxy_context_load_timeline_seqno(ctx, ring_idx);
-      if (!proxy_context_retire_timeline_fences_locked(ctx, ring_idx, cur_seqno,
-                                                       timed_out))
+      if (!proxy_context_retire_timeline_fences_locked(ctx, ring_idx, cur_seqno))
          new_busy_mask |= 1ull << ring_idx;
    }
 
@@ -176,43 +196,73 @@ proxy_context_retire_fences_internal(struct proxy_context *ctx, bool timed_out)
       mtx_unlock(&ctx->timeline_mutex);
 }
 
+static bool
+proxy_context_sync_has_work(void *opaque)
+{
+   struct proxy_context *ctx = opaque;
+   uint64_t busy = atomic_load_explicit(&ctx->timeline_busy_mask,
+                                        memory_order_acquire);
+   while (busy) {
+      const uint32_t ring_idx = u_bit_scan64(&busy);
+      if (proxy_context_load_timeline_seqno(ctx, ring_idx) !=
+          ctx->timelines[ring_idx].cur_seqno)
+         return true;
+   }
+   return false;
+}
+
 static int
 proxy_context_sync_thread(void *arg)
 {
    struct proxy_context *ctx = arg;
-   struct pollfd poll_fds[2] = {
-      [0] = {
-         .fd = ctx->sync_thread.fence_eventfd,
-         .events = POLLIN,
-      },
-      [1] = {
-         .fd = ctx->socket.fd,
-      },
-   };
 
    assert(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB);
 
-   /* macOS never reports POLLHUP for poll_fds[1] (see
-    * proxy_socket_is_connected), so a worker that dies with fences in flight
-    * would leave this thread asleep and those fences unretired for good -- a
-    * hung engine to the guest.  Wake periodically there instead. */
-#ifdef __APPLE__
-   const int timeout_ms = 100;
-#else
-   const int timeout_ms = -1;
-#endif
+   _Atomic uint64_t *vmm_sleeps =
+      ctx->ring ? &ctx->ring->stats_vmm.v.vmm_sleeps : NULL;
 
    while (!ctx->sync_thread.stop) {
-      const int ret = poll(poll_fds, ARRAY_SIZE(poll_fds), timeout_ms);
-      if (ret < 0) {
-         if (errno == EINTR || errno == EAGAIN)
-            continue;
+      proxy_context_retire_fences_internal(ctx);
+      if (ctx->sync_thread.stop)
+         break;
 
+      /* Poll the completion wake fd and the death pipe with no timeout:
+       * the worker closes the pipe on exit, so a dead worker can no
+       * longer strand this thread and its pending fences. */
+      const int death_fd = ctx->death_read_fd;
+      const enum render_ring_wait_result res = render_ring_consumer_wait(
+         &ctx->ring->vmm_state.value, ctx->sync_thread.fence_eventfd, death_fd,
+         proxy_context_sync_has_work, ctx, 0 /* spin_ns */, -1 /* timeout */,
+         vmm_sleeps);
+      if (ctx->lat)
+         ctx->lat_vmm_wake_ts = render_ring_now_ns();
+
+      if (res == RENDER_RING_WAIT_ERROR) {
          proxy_log("failed to poll fence eventfd");
          break;
       }
 
-      proxy_context_retire_fences_internal(ctx, ret == 0);
+      if (res == RENDER_RING_WAIT_FD1 && death_fd >= 0) {
+         /* death pipe readable (EOF) or HUP: the worker is gone */
+         char b;
+         const ssize_t r = read(death_fd, &b, 1);
+         if (r == 0 || (r < 0 && errno != EAGAIN && errno != EINTR)) {
+            proxy_log("ctx %d worker died; retiring all fences",
+                      ctx->base.ctx_id);
+            /* seq_cst: pairs with the submit_fence post-publish load, so
+             * a fence registered after this store always sees it */
+            atomic_store_explicit(&ctx->worker_dead, true,
+                                  memory_order_seq_cst);
+            struct npt_context_status_page *page =
+               atomic_load_explicit(&ctx->status_page, memory_order_seq_cst);
+            if (page)
+               proxy_status_page_mark_lost(page, NPT_CONTEXT_STATUS_LOST_WORKER_EXIT,
+                                           render_ring_now_ns());
+            close(death_fd);
+            ctx->death_read_fd = -1;
+            proxy_context_retire_fences_internal(ctx);
+         }
+      }
    }
 
    return 0;
@@ -221,85 +271,140 @@ proxy_context_sync_thread(void *arg)
 /* Out-of-band fence routing.  Only Neptune event-ring fences qualify:
  * their retirement pairs with an ARM that travels independently (the host
  * parks whichever side arrives first), so registering them ahead of queued
- * submits is legal -- and registering them promptly is the point, since on
- * the main socket a fence queues behind the dispatch thread's in-flight
- * submits and every present-gate wake lags that backlog.  Low rings retire
- * in dispatch order ("everything before me was consumed") and have to stay
- * on the ordered main socket.  The ring split mirrors the host's
+ * submits is legal -- and registering them promptly is the point, since in
+ * the main ring a fence queues behind the worker's in-flight submits and
+ * every present-gate wake lags that backlog.  Low rings retire in dispatch
+ * order ("everything before me was consumed") and have to stay on the
+ * ordered main ring.  The ring split mirrors the host's
  * NPT_EVENT_RING_BASE convention: the upper half of the timeline range. */
 static bool
 proxy_context_fence_ring_is_oob(const struct proxy_context *ctx,
                                 uint32_t ring_idx)
 {
-   return ctx->capset_id == VIRTGPU_DRM_CAPSET_NEPTUNE &&
-          ring_idx >= PROXY_CONTEXT_TIMELINE_COUNT / 2;
+   return ctx->has_oob_ring && ring_idx >= PROXY_CONTEXT_TIMELINE_COUNT / 2;
 }
 
-static bool
-proxy_context_fence_socket_attach(struct proxy_context *ctx)
+static void
+proxy_context_ring_stats_log(struct proxy_context *ctx)
 {
-   int fds[2];
-   if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds)) {
-      proxy_log("fence channel: socketpair failed");
-      return false;
-   }
-   for (int i = 0; i < 2; i++) {
-      const int flags = fcntl(fds[i], F_GETFD);
-      if (flags >= 0)
-         fcntl(fds[i], F_SETFD, flags | FD_CLOEXEC);
-   }
-
-   const struct render_context_op_attach_fence_socket_request req = {
-      .header.op = RENDER_CONTEXT_OP_ATTACH_FENCE_SOCKET,
-   };
-   if (!proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req),
-                                           &fds[1], 1)) {
-      proxy_log("fence channel: attach failed");
-      close(fds[0]);
-      close(fds[1]);
-      return false;
-   }
-   close(fds[1]);
-   ctx->fence_socket_fd = fds[0];
-   proxy_log("fence channel attached for ctx %d (event-ring fences "
-             "out-of-band)", ctx->base.ctx_id);
-   return true;
+   const struct render_ring_stats_vmm *sv = &ctx->ring->stats_vmm.v;
+   const struct render_ring_stats_worker *sw = &ctx->ring->stats_worker.v;
+   proxy_log("ring stats ctx %u: main_entries=%llu main_wakes=%llu "
+             "main_sleeps=%llu oob_entries=%llu oob_wakes=%llu "
+             "oob_sleeps=%llu fence_notifies=%llu vmm_sleeps=%llu "
+             "backpressure_waits=%llu socket_payload_cmds=%llu",
+             ctx->base.ctx_id,
+             (unsigned long long)atomic_load(&sv->main_entries),
+             (unsigned long long)atomic_load(&sv->main_wakes),
+             (unsigned long long)atomic_load(&sw->main_sleeps),
+             (unsigned long long)atomic_load(&sv->oob_entries),
+             (unsigned long long)atomic_load(&sv->oob_wakes),
+             (unsigned long long)atomic_load(&sw->oob_sleeps),
+             (unsigned long long)atomic_load(&sw->fence_notifies),
+             (unsigned long long)atomic_load(&sv->vmm_sleeps),
+             (unsigned long long)atomic_load(&sv->backpressure_waits),
+             (unsigned long long)atomic_load(&sv->socket_payload_cmds));
 }
 
-static bool
-proxy_context_fence_oob_submit(struct proxy_context *ctx,
-                               uint32_t flags,
-                               uint32_t ring_idx,
-                               uint32_t seqno)
+static void
+proxy_context_ring_stats_maybe_log(struct proxy_context *ctx, uint64_t entries)
 {
-   if (ctx->fence_socket_fd == -1 && !proxy_context_fence_socket_attach(ctx))
-      ctx->fence_socket_fd = -2;
-   if (ctx->fence_socket_fd < 0)
-      return false;
+   if (ctx->ring_stats_enabled && entries % 65536 == 0)
+      proxy_context_ring_stats_log(ctx);
+}
 
-   const struct render_context_op_submit_fence_request req = {
-      .header.op = RENDER_CONTEXT_OP_SUBMIT_FENCE,
-      .flags = flags,
-      .ring_index = ring_idx,
-      .seqno = seqno,
-   };
-   const uint8_t *cur = (const uint8_t *)&req;
-   size_t left = sizeof(req);
-   while (left) {
-      const ssize_t s = send(ctx->fence_socket_fd, cur, left, MSG_NOSIGNAL);
-      if (s < 0) {
-         if (errno == EINTR || errno == EAGAIN)
-            continue;
-         proxy_log("fence channel: send failed (errno %d); falling back to "
-                   "the main socket", errno);
-         close(ctx->fence_socket_fd);
-         ctx->fence_socket_fd = -2;
-         return false;
+/* Bounded wait for ring space: spin/yield briefly, then nanosleep(20 us)
+ * until the consumer catches up.  Returns false only when the worker is
+ * dead -- producers must never hang once worker_dead is set.
+ *
+ * Caller holds ring_mutex. */
+static bool
+proxy_context_ring_push(struct proxy_context *ctx,
+                        uint32_t op,
+                        const void *payload,
+                        uint32_t size)
+{
+   unsigned spins = 0;
+   const struct timespec backoff = { .tv_sec = 0, .tv_nsec = 20000 };
+   for (;;) {
+      if (render_ring_push(&ctx->main_ring, op, payload, size)) {
+         const uint64_t entries =
+            atomic_fetch_add(&ctx->ring->stats_vmm.v.main_entries, 1) + 1;
+         render_ring_producer_wake(&ctx->ring->main_state.value,
+                                   ctx->main_wake_write,
+                                   &ctx->ring->stats_vmm.v.main_wakes);
+         proxy_context_ring_stats_maybe_log(ctx, entries);
+         return true;
       }
-      cur += s;
-      left -= (size_t)s;
+      if (atomic_load_explicit(&ctx->worker_dead, memory_order_acquire))
+         return false;
+      atomic_fetch_add(&ctx->ring->stats_vmm.v.backpressure_waits, 1);
+      if (spins++ < 100)
+         sched_yield();
+      else
+         nanosleep(&backoff, NULL);
    }
-   return true;
+}
+
+static bool
+proxy_context_ring_push_oob(struct proxy_context *ctx,
+                            const struct render_ring_fence *fence)
+{
+   unsigned spins = 0;
+   const struct timespec backoff = { .tv_sec = 0, .tv_nsec = 20000 };
+   for (;;) {
+      if (render_ring_oob_push(&ctx->oob_ring, fence)) {
+         atomic_fetch_add(&ctx->ring->stats_vmm.v.oob_entries, 1);
+         render_ring_producer_wake(&ctx->ring->oob_state.value,
+                                   ctx->oob_wake_write,
+                                   &ctx->ring->stats_vmm.v.oob_wakes);
+         return true;
+      }
+      if (atomic_load_explicit(&ctx->worker_dead, memory_order_acquire))
+         return false;
+      atomic_fetch_add(&ctx->ring->stats_vmm.v.backpressure_waits, 1);
+      if (spins++ < 100)
+         sched_yield();
+      else
+         nanosleep(&backoff, NULL);
+   }
+}
+
+/* Publish the (ring_idx, seqno) -> fence_id mapping the worker reads
+ * back off the latency trace area.  Must run before the ring push:
+ * the worker's acquire of the tail orders this write in. */
+static void
+proxy_context_lat_seqmap_publish(struct proxy_context *ctx,
+                                 uint32_t ring_idx, uint32_t seqno,
+                                 uint64_t fence_id)
+{
+   struct render_ring_lat_seqent *se =
+      render_ring_lat_seqmap(ctx->lat, ring_idx, seqno);
+   atomic_store_explicit(&se->seqno, seqno, memory_order_relaxed);
+   atomic_store_explicit(&se->fence_id, fence_id, memory_order_release);
+}
+
+/* Initialize the latency record for a just-pushed fence.  Caller holds
+ * ring_mutex so concurrent submit_fence calls cannot interleave record
+ * writes; fence_id is stored last (release) so the worker only ever sees
+ * a fully initialized record. */
+static void
+proxy_context_lat_submit(struct proxy_context *ctx, uint64_t fence_id,
+                         uint32_t ring_idx, uint32_t path, uint64_t t_arrive)
+{
+   const uint32_t idx = (uint32_t)(fence_id & (RENDER_RING_LAT_RECORDS - 1));
+   struct render_ring_lat_rec *rec = &ctx->lat->recs[idx];
+   ctx->lat->ring_idx[idx] = ring_idx;
+   ctx->lat->path[idx] = path;
+   rec->t_arrive = t_arrive;
+   rec->t_pushed = render_ring_now_ns();
+   rec->t_worker_recv = 0;
+   rec->t_worker_signal = 0;
+   rec->t_vmm_wake = 0;
+   rec->t_vmm_cb_begin = 0;
+   rec->t_vmm_cb_end = 0;
+   atomic_thread_fence(memory_order_seq_cst);
+   atomic_store_explicit(&rec->fence_id, fence_id, memory_order_release);
 }
 
 static int
@@ -310,6 +415,7 @@ proxy_context_submit_fence(struct virgl_context *base,
 {
    struct proxy_context *ctx = (struct proxy_context *)base;
    const uint64_t old_busy_mask = ctx->timeline_busy_mask;
+   const uint64_t lat_t_arrive = ctx->lat ? render_ring_now_ns() : 0;
 
    if (ring_idx >= PROXY_CONTEXT_TIMELINE_COUNT)
       return -EINVAL;
@@ -332,22 +438,45 @@ proxy_context_submit_fence(struct virgl_context *base,
    if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
       mtx_unlock(&ctx->timeline_mutex);
 
-   /* Event-ring fences take the out-of-band channel: registered by the
-    * server's dedicated fence thread instead of queueing behind the
-    * dispatch thread's in-flight submits, and the QEMU virtio thread
-    * pays no reply round trip.  Any channel failure falls through to
-    * the ordered synchronous path below. */
-   if (proxy_context_fence_ring_is_oob(ctx, ring_idx) &&
-       proxy_context_fence_oob_submit(ctx, flags, ring_idx, fence->seqno))
-      return 0;
-
-   const struct render_context_op_submit_fence_request req = {
-      .header.op = RENDER_CONTEXT_OP_SUBMIT_FENCE,
+   /* Event-ring fences take the out-of-band ring: registered by the
+    * worker's dedicated oob thread instead of queueing behind the
+    * dispatch loop's in-flight submits.  Any channel failure falls
+    * through to the ordered main-ring path below. */
+   const struct render_ring_fence rf = {
       .flags = flags,
-      .ring_index = ring_idx,
+      .ring_idx = ring_idx,
       .seqno = fence->seqno,
    };
-   if (proxy_socket_send_request(&ctx->socket, &req, sizeof(req)))
+   bool ok;
+   uint32_t lat_path = 0;
+   mtx_lock(&ctx->ring_mutex);
+   if (ctx->lat)
+      proxy_context_lat_seqmap_publish(ctx, ring_idx, fence->seqno,
+                                       fence_id);
+   if (proxy_context_fence_ring_is_oob(ctx, ring_idx)) {
+      ok = proxy_context_ring_push_oob(ctx, &rf);
+      lat_path = 1;
+   } else {
+      ok = proxy_context_ring_push(ctx, RENDER_RING_OP_SUBMIT_FENCE, &rf,
+                                   sizeof(rf));
+   }
+   if (ok && ctx->lat)
+      proxy_context_lat_submit(ctx, fence_id, ring_idx, lat_path,
+                               lat_t_arrive);
+   mtx_unlock(&ctx->ring_mutex);
+
+   /* The push may have succeeded on ring space that was still free while
+    * the worker died between this fence's registration and the sync
+    * thread's force-retire pass.  Re-check with seq_cst (paired with the
+    * sync thread's store before it takes timeline_mutex): if the worker
+    * is dead, keep the fence registered and nudge the sync thread into
+    * another retire pass -- the fence gets force-retired like the rest. */
+   if (atomic_load_explicit(&ctx->worker_dead, memory_order_seq_cst)) {
+      write_eventfd(ctx->sync_thread.fence_eventfd_write, 1);
+      return 0;
+   }
+
+   if (ok)
       return 0;
 
    /* recover timeline fences and busy_mask on submit_fence request failure */
@@ -371,7 +500,7 @@ proxy_context_retire_fences(struct virgl_context *base)
    struct proxy_context *ctx = (struct proxy_context *)base;
 
    assert(!(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB));
-   proxy_context_retire_fences_internal(ctx, false);
+   proxy_context_retire_fences_internal(ctx);
 }
 
 static int
@@ -391,25 +520,32 @@ proxy_context_submit_cmd(struct virgl_context *base, const void *buffer, size_t 
    if (!size)
       return 0;
 
-   struct render_context_op_submit_cmd_request req = {
-      .header.op = RENDER_CONTEXT_OP_SUBMIT_CMD,
-      .size = size,
-   };
+   if (atomic_load_explicit(&ctx->worker_dead, memory_order_acquire))
+      return -EIO;
 
-   const size_t inlined = MIN2(size, sizeof(req.cmd));
-   memcpy(req.cmd, buffer, inlined);
+   bool ok;
+   mtx_lock(&ctx->ring_mutex);
+   if (size <= RENDER_RING_MAX_INLINE_CMD) {
+      ok = proxy_context_ring_push(ctx, RENDER_RING_OP_SUBMIT_CMD, buffer,
+                                   (uint32_t)size);
+   } else {
+      /* oversized payload: publish the marker first, then the command
+       * bytes follow on the context socket */
+      const uint32_t wire_size = (uint32_t)size;
+      ok = proxy_context_ring_push(ctx, RENDER_RING_OP_SUBMIT_CMD_SOCKET,
+                                   &wire_size, sizeof(wire_size));
+      if (ok) {
+         ok = proxy_socket_send_request(&ctx->socket, buffer, size);
+         atomic_fetch_add(&ctx->ring->stats_vmm.v.socket_payload_cmds, 1);
+         if (!ok)
+            proxy_log("failed to submit large cmd buffer");
+      }
+   }
+   mtx_unlock(&ctx->ring_mutex);
 
-   if (!proxy_socket_send_request(&ctx->socket, &req, sizeof(req))) {
+   if (!ok) {
       proxy_log("failed to submit cmd");
       return -1;
-   }
-
-   if (size > inlined) {
-      if (!proxy_socket_send_request(&ctx->socket, (const char *)buffer + inlined,
-                                     size - inlined)) {
-         proxy_log("failed to submit large cmd buffer");
-         return -1;
-      }
    }
 
    return 0;
@@ -454,6 +590,69 @@ add_required_seals_to_fd(int fd)
 #endif
 }
 
+static struct npt_context_status_page *
+proxy_context_status_page_create(struct proxy_context *ctx)
+{
+   int fd = os_create_anonymous_file(NPT_CONTEXT_STATUS_PAGE_SIZE, "npt-status");
+   if (fd < 0)
+      return NULL;
+   if (add_required_seals_to_fd(fd)) {
+      close(fd);
+      return NULL;
+   }
+
+   void *ptr = mmap(NULL, NPT_CONTEXT_STATUS_PAGE_SIZE, PROT_READ | PROT_WRITE,
+                    MAP_SHARED, fd, 0);
+   if (ptr == MAP_FAILED) {
+      close(fd);
+      return NULL;
+   }
+
+   proxy_status_page_init(ptr);
+   ctx->status_fd = fd;
+   return ptr;
+}
+
+static int
+proxy_context_get_status_blob(struct proxy_context *ctx, uint32_t res_id,
+                              uint64_t blob_size, struct virgl_context_blob *blob)
+{
+   if (blob_size != NPT_CONTEXT_STATUS_PAGE_SIZE) {
+      proxy_log("status blob size %" PRIu64 " for res %d", blob_size, res_id);
+      return -1;
+   }
+
+   struct npt_context_status_page *page =
+      atomic_load_explicit(&ctx->status_page, memory_order_acquire);
+   if (!page) {
+      page = proxy_context_status_page_create(ctx);
+      if (!page) {
+         proxy_log("failed to create status page for ctx %d", ctx->base.ctx_id);
+         return -1;
+      }
+      atomic_store_explicit(&ctx->status_page, page, memory_order_seq_cst);
+      /* pairs with the death path: either it sees this page, or we see its
+       * worker_dead store */
+      if (atomic_load_explicit(&ctx->worker_dead, memory_order_seq_cst))
+         proxy_status_page_mark_lost(page, NPT_CONTEXT_STATUS_LOST_WORKER_EXIT,
+                                     render_ring_now_ns());
+      proxy_log("ctx %d: status page created (res %d, fd %d)", ctx->base.ctx_id,
+                res_id, ctx->status_fd);
+   }
+
+   const int fd = dup(ctx->status_fd);
+   if (fd < 0)
+      return -1;
+
+   blob->type = VIRGL_RESOURCE_FD_SHM;
+   blob->u.fd = fd;
+   blob->map_info = VIRGL_RENDERER_MAP_CACHE_CACHED;
+   blob->export_format = 0;
+
+   _mesa_hash_table_insert(ctx->status_resource_table, (void *)(uintptr_t)res_id, NULL);
+   return 0;
+}
+
 static int
 proxy_context_get_blob(struct virgl_context *base,
                        uint32_t res_id,
@@ -468,6 +667,9 @@ proxy_context_get_blob(struct virgl_context *base,
     */
    struct proxy_context *ctx = (struct proxy_context *)base;
 
+   if (blob_id == NPT_CONTEXT_STATUS_BLOB_ID)
+      return proxy_context_get_status_blob(ctx, res_id, blob_size, blob);
+
    const struct render_context_op_create_resource_request req = {
       .header.op = RENDER_CONTEXT_OP_CREATE_RESOURCE,
       .res_id = res_id,
@@ -475,7 +677,17 @@ proxy_context_get_blob(struct virgl_context *base,
       .blob_size = blob_size,
       .blob_flags = blob_flags,
    };
-   if (!proxy_socket_send_request(&ctx->socket, &req, sizeof(req))) {
+
+   /* Cold ops keep fds and replies on the socket; the SOCKET_REQUEST
+    * marker preserves their order relative to ring submits.  The mutex
+    * is held across the whole transaction so concurrent producers can
+    * neither reorder markers nor interleave socket bytes. */
+   mtx_lock(&ctx->ring_mutex);
+   bool ok = proxy_context_ring_push(ctx, RENDER_RING_OP_SOCKET_REQUEST, NULL, 0);
+   if (ok)
+      ok = proxy_socket_send_request(&ctx->socket, &req, sizeof(req));
+   if (!ok) {
+      mtx_unlock(&ctx->ring_mutex);
       proxy_log("failed to get blob %" PRIu64, blob_id);
       return -1;
    }
@@ -483,8 +695,10 @@ proxy_context_get_blob(struct virgl_context *base,
    struct render_context_op_create_resource_reply reply;
    int reply_fd;
    int reply_fd_count;
-   if (!proxy_socket_receive_reply_with_fds(&ctx->socket, &reply, sizeof(reply),
-                                            &reply_fd, 1, &reply_fd_count)) {
+   ok = proxy_socket_receive_reply_with_fds(&ctx->socket, &reply, sizeof(reply),
+                                            &reply_fd, 1, &reply_fd_count);
+   mtx_unlock(&ctx->ring_mutex);
+   if (!ok) {
       proxy_log("failed to get reply of blob %" PRIu64, blob_id);
       return -1;
    }
@@ -558,7 +772,12 @@ proxy_context_detach_resource(struct virgl_context *base, struct virgl_resource 
       .header.op = RENDER_CONTEXT_OP_DESTROY_RESOURCE,
       .res_id = res_id,
    };
-   if (!proxy_socket_send_request(&ctx->socket, &req, sizeof(req)))
+   mtx_lock(&ctx->ring_mutex);
+   bool ok = proxy_context_ring_push(ctx, RENDER_RING_OP_SOCKET_REQUEST, NULL, 0);
+   if (ok)
+      ok = proxy_socket_send_request(&ctx->socket, &req, sizeof(req));
+   mtx_unlock(&ctx->ring_mutex);
+   if (!ok)
       proxy_log("failed to detach res %d", res_id);
 
    proxy_context_resource_remove(ctx, res_id);
@@ -571,7 +790,8 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
    const uint32_t res_id = res->res_id;
 
    /* avoid importing resources created from RENDER_CONTEXT_OP_CREATE_RESOURCE */
-   if (proxy_context_resource_find(ctx, res_id))
+   if (proxy_context_resource_find(ctx, res_id) ||
+       proxy_context_status_resource_find(ctx, res_id))
       return;
 
    /* The current render protocol only supports importing dma-buf, shm or pipe resource
@@ -617,13 +837,99 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
       .size = res_size,
       .export_format = res->export_format,
    };
-   if (!proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req), &res_fd, 1))
+   mtx_lock(&ctx->ring_mutex);
+   bool ok = proxy_context_ring_push(ctx, RENDER_RING_OP_SOCKET_REQUEST, NULL, 0);
+   if (ok)
+      ok = proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req),
+                                              &res_fd, 1);
+   mtx_unlock(&ctx->ring_mutex);
+   if (!ok)
       proxy_log("failed to attach res %d", res_id);
 
    if (res_fd >= 0 && close_res_fd)
       close(res_fd);
 
    proxy_context_resource_add(ctx, res_id);
+}
+
+struct proxy_lat_row {
+   uint64_t fence_id;
+   uint32_t ring_idx;
+   uint32_t path;
+   const struct render_ring_lat_rec *rec;
+};
+
+static int
+proxy_lat_row_cmp(const void *a, const void *b)
+{
+   const struct proxy_lat_row *ra = a;
+   const struct proxy_lat_row *rb = b;
+   return (ra->fence_id > rb->fence_id) - (ra->fence_id < rb->fence_id);
+}
+
+static void
+proxy_context_lat_dump(struct proxy_context *ctx)
+{
+   const struct render_ring_lat_area *lat = ctx->lat;
+
+   uint32_t count = 0;
+   for (uint32_t i = 0; i < RENDER_RING_LAT_RECORDS; i++)
+      if (atomic_load_explicit(&lat->recs[i].fence_id,
+                               memory_order_acquire) != 0)
+         count++;
+   if (!count)
+      return;
+
+   struct proxy_lat_row *rows = malloc(count * sizeof(*rows));
+   if (!rows)
+      return;
+   uint32_t n = 0;
+   for (uint32_t i = 0; i < RENDER_RING_LAT_RECORDS; i++) {
+      const uint64_t fence_id = atomic_load_explicit(
+         &lat->recs[i].fence_id, memory_order_acquire);
+      if (!fence_id)
+         continue;
+      rows[n++] = (struct proxy_lat_row){
+         .fence_id = fence_id,
+         .ring_idx = lat->ring_idx[i],
+         .path = lat->path[i],
+         .rec = &lat->recs[i],
+      };
+   }
+   qsort(rows, n, sizeof(*rows), proxy_lat_row_cmp);
+
+   if (mkdir(ctx->lat_trace_dir, 0755) && errno != EEXIST) {
+      proxy_log("latency trace: cannot create %s", ctx->lat_trace_dir);
+      free(rows);
+      return;
+   }
+   char path[4096];
+   snprintf(path, sizeof(path), "%s/lat-ctx%u-%d.csv", ctx->lat_trace_dir,
+            ctx->base.ctx_id, getpid());
+   FILE *f = fopen(path, "w");
+   if (!f) {
+      proxy_log("latency trace: cannot write %s", path);
+      free(rows);
+      return;
+   }
+   fprintf(f, "fence_id,ring_idx,path,t_arrive,t_pushed,t_worker_recv,"
+              "t_worker_signal,t_vmm_wake,t_vmm_cb_begin,t_vmm_cb_end\n");
+   for (uint32_t i = 0; i < n; i++) {
+      const struct render_ring_lat_rec *r = rows[i].rec;
+      fprintf(f, "%llu,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+              (unsigned long long)rows[i].fence_id, rows[i].ring_idx,
+              rows[i].path,
+              (unsigned long long)r->t_arrive,
+              (unsigned long long)r->t_pushed,
+              (unsigned long long)r->t_worker_recv,
+              (unsigned long long)r->t_worker_signal,
+              (unsigned long long)r->t_vmm_wake,
+              (unsigned long long)r->t_vmm_cb_begin,
+              (unsigned long long)r->t_vmm_cb_end);
+   }
+   fclose(f);
+   proxy_log("latency trace: wrote %s (%u rows)", path, n);
+   free(rows);
 }
 
 static void
@@ -644,10 +950,27 @@ proxy_context_destroy(struct virgl_context *base)
       close(ctx->sync_thread.fence_eventfd);
    }
 
-   if (ctx->fence_socket_fd >= 0) {
-      close(ctx->fence_socket_fd);
-      ctx->fence_socket_fd = -1;
-   }
+   if (ctx->ring_stats_enabled && ctx->ring)
+      proxy_context_ring_stats_log(ctx);
+
+   if (ctx->lat)
+      proxy_context_lat_dump(ctx);
+
+   if (ctx->main_wake_write >= 0)
+      close(ctx->main_wake_write);
+   if (ctx->oob_wake_write >= 0)
+      close(ctx->oob_wake_write);
+   if (ctx->death_read_fd >= 0)
+      close(ctx->death_read_fd);
+   if (ctx->ring_fds.completion_write >= 0 &&
+       ctx->ring_fds.completion_write != ctx->sync_thread.fence_eventfd_write)
+      close(ctx->ring_fds.completion_write);
+   if (ctx->ring_fds.main_wake_read >= 0)
+      close(ctx->ring_fds.main_wake_read);
+   if (ctx->ring_fds.death_write >= 0)
+      close(ctx->ring_fds.death_write);
+   if (ctx->ring_fds.oob_wake_read >= 0)
+      close(ctx->ring_fds.oob_wake_read);
    proxy_socket_fini(&ctx->socket);
 
    /* ask the server process to terminate the context process */
@@ -658,6 +981,13 @@ proxy_context_destroy(struct virgl_context *base)
       munmap(ctx->shmem.ptr, ctx->shmem.size);
    if (ctx->shmem.fd >= 0)
       close(ctx->shmem.fd);
+
+   struct npt_context_status_page *status_page =
+      atomic_load_explicit(&ctx->status_page, memory_order_acquire);
+   if (status_page)
+      munmap(status_page, NPT_CONTEXT_STATUS_PAGE_SIZE);
+   if (ctx->status_fd >= 0)
+      close(ctx->status_fd);
 
    if (ctx->timeline_seqnos) {
       for (uint32_t i = 0; i < PROXY_CONTEXT_TIMELINE_COUNT; i++) {
@@ -670,6 +1000,7 @@ proxy_context_destroy(struct virgl_context *base)
       }
    }
    mtx_destroy(&ctx->timeline_mutex);
+   mtx_destroy(&ctx->ring_mutex);
 
    list_for_each_entry_safe (struct proxy_fence, fence, &ctx->free_fences, head)
       free(fence);
@@ -695,24 +1026,75 @@ proxy_context_init_base(struct proxy_context *ctx)
    ctx->base.submit_fence = proxy_context_submit_fence;
 }
 
+/* On eventfd platforms create_fence_pipe hands back one fd for both ends,
+ * so the fd sent to the worker must be a dup: closing our own copy after
+ * INIT would kill our end of the channel too.  When the ends differ the
+ * fd itself travels. */
+static int
+proxy_context_worker_fd(int fd, int other_end)
+{
+   return fd == other_end ? dup(fd) : fd;
+}
+
 static bool
 proxy_context_init_fencing(struct proxy_context *ctx)
 {
-   /* The render server updates the shmem for the current seqnos and
-    * optionally notifies using the eventfd.  That means, when only
-    * VIRGL_RENDERER_THREAD_SYNC is set, we just need to set up the eventfd.
-    * When VIRGL_RENDERER_ASYNC_FENCE_CB is also set, we need to create a sync
-    * thread as well.
-    *
-    * Fence polling can always check the shmem directly.
+   /* The render worker updates the shmem timelines and conditionally
+    * signals the completion wake fd (always when the client lacks
+    * VIRGL_RENDERER_ASYNC_FENCE_CB).  The main/oob wake pipes let the
+    * proxy wake the worker's ring consumers, and the death pipe reports
+    * worker exit to the sync thread.
     */
-   if (!(proxy_renderer.flags & VIRGL_RENDERER_THREAD_SYNC))
-      return true;
-
    if (create_fence_pipe(&ctx->sync_thread.fence_eventfd,
                          &ctx->sync_thread.fence_eventfd_write)) {
       proxy_log("failed to create fence eventfd/pipe");
       return false;
+   }
+   /* the worker gets its own completion-wake write end */
+   ctx->ring_fds.completion_write =
+      proxy_context_worker_fd(ctx->sync_thread.fence_eventfd_write,
+                              ctx->sync_thread.fence_eventfd);
+
+   int main_wake_read;
+   if (create_fence_pipe(&main_wake_read, &ctx->main_wake_write)) {
+      proxy_log("failed to create main ring wake pipe");
+      return false;
+   }
+   ctx->ring_fds.main_wake_read =
+      proxy_context_worker_fd(main_wake_read, ctx->main_wake_write);
+
+   /* the death channel must be a real pipe on every platform: an eventfd
+    * can never report EOF and would mask worker death entirely */
+   int death_fds[2];
+   if (pipe(death_fds)) {
+      proxy_log("failed to create worker death pipe");
+      return false;
+   }
+   for (int i = 0; i < 2; i++) {
+      const int fdflags = fcntl(death_fds[i], F_GETFD);
+      const int stflags = fcntl(death_fds[i], F_GETFL);
+      if (fdflags < 0 || fcntl(death_fds[i], F_SETFD, fdflags | FD_CLOEXEC) ||
+          stflags < 0 || fcntl(death_fds[i], F_SETFL, stflags | O_NONBLOCK)) {
+         close(death_fds[0]);
+         close(death_fds[1]);
+         proxy_log("failed to set up worker death pipe");
+         return false;
+      }
+   }
+#ifdef F_SETNOSIGPIPE
+   fcntl(death_fds[1], F_SETNOSIGPIPE, 1);
+#endif
+   ctx->death_read_fd = death_fds[0];
+   ctx->ring_fds.death_write = death_fds[1];
+
+   if (ctx->has_oob_ring) {
+      int oob_wake_read;
+      if (create_fence_pipe(&oob_wake_read, &ctx->oob_wake_write)) {
+         proxy_log("failed to create oob ring wake pipe");
+         return false;
+      }
+      ctx->ring_fds.oob_wake_read =
+         proxy_context_worker_fd(oob_wake_read, ctx->oob_wake_write);
    }
 
    if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB) {
@@ -730,7 +1112,7 @@ proxy_context_init_fencing(struct proxy_context *ctx)
 static bool
 proxy_context_init_timelines(struct proxy_context *ctx)
 {
-   atomic_uint *timeline_seqnos = ctx->shmem.ptr;
+   atomic_uint *timeline_seqnos = ctx->ring->timelines;
    for (uint32_t i = 0; i < ARRAY_SIZE(ctx->timelines); i++) {
       atomic_init(&timeline_seqnos[i], 0);
 
@@ -774,12 +1156,23 @@ fail:
 static bool
 proxy_context_init_shmem(struct proxy_context *ctx)
 {
-   const size_t shmem_size = sizeof(*ctx->timeline_seqnos) * PROXY_CONTEXT_TIMELINE_COUNT;
-   ctx->shmem.fd = alloc_memfd("proxy-ctx", shmem_size, &ctx->shmem.ptr);
+   struct render_ring_layout layout;
+   render_ring_layout_compute(&layout, ctx->has_oob_ring,
+                              ctx->lat_trace_enabled);
+
+   ctx->shmem.fd = alloc_memfd("proxy-ctx", layout.total_size, &ctx->shmem.ptr);
    if (ctx->shmem.fd < 0)
       return false;
 
-   ctx->shmem.size = shmem_size;
+   ctx->shmem.size = layout.total_size;
+   ctx->ring = ctx->shmem.ptr;
+   render_ring_control_init(ctx->ring);
+   ctx->main_ring = render_ring_main_buf(ctx->ring, ctx->shmem.ptr,
+                                         layout.main_offset, layout.main_size);
+   if (ctx->has_oob_ring)
+      ctx->oob_ring = render_ring_oob_buf(ctx->ring, ctx->shmem.ptr,
+                                          layout.oob_offset, layout.oob_size);
+   ctx->lat = render_ring_lat_area(ctx->shmem.ptr, layout.lat_offset);
 
    return true;
 }
@@ -793,18 +1186,59 @@ proxy_context_init(struct proxy_context *ctx, uint32_t ctx_flags)
       return false;
    }
 
+   struct render_ring_layout layout;
+   render_ring_layout_compute(&layout, ctx->has_oob_ring,
+                              ctx->lat_trace_enabled);
+
+   /* Without VIRGL_RENDERER_ASYNC_FENCE_CB the client polls the
+    * completion fd itself, so the worker must signal every update. */
+   uint32_t ring_flags =
+      (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
+         ? 0
+         : RENDER_RING_FLAG_ALWAYS_NOTIFY;
+   if (ctx->lat_trace_enabled)
+      ring_flags |= RENDER_RING_FLAG_LATENCY_TRACE;
+
    const struct render_context_op_init_request req = {
       .header.op = RENDER_CONTEXT_OP_INIT,
       .flags = ctx_flags,
+      .ring_flags = ring_flags,
       .shmem_size = ctx->shmem.size,
+      .main_ring_offset = layout.main_offset,
+      .main_ring_size = layout.main_size,
+      .oob_ring_offset = layout.oob_offset,
+      .oob_ring_size = layout.oob_size,
+      .lat_ring_offset = layout.lat_offset,
+      .lat_ring_size = layout.lat_size,
       .work_context = ctx->work_context_config,
    };
-   const int req_fds[2] = { ctx->shmem.fd, ctx->sync_thread.fence_eventfd_write };
-   const int req_fd_count = req_fds[1] >= 0 ? 2 : 1;
+   const int req_fds[5] = {
+      ctx->shmem.fd,
+      ctx->ring_fds.completion_write,
+      ctx->ring_fds.main_wake_read,
+      ctx->ring_fds.death_write,
+      ctx->ring_fds.oob_wake_read,
+   };
+   const int req_fd_count = ctx->has_oob_ring ? 5 : 4;
    if (!proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req), req_fds,
                                            req_fd_count)) {
       proxy_log("failed to initialize context");
       return false;
+   }
+
+   /* the worker holds its own copies now; drop the ones we must not keep
+    * (the death pipe reports EOF exactly when the worker exits; a dup
+    * close leaves our own end intact on eventfd platforms) */
+   if (ctx->ring_fds.completion_write != ctx->sync_thread.fence_eventfd_write)
+      close(ctx->ring_fds.completion_write);
+   ctx->ring_fds.completion_write = -1;
+   close(ctx->ring_fds.main_wake_read);
+   close(ctx->ring_fds.death_write);
+   ctx->ring_fds.main_wake_read = -1;
+   ctx->ring_fds.death_write = -1;
+   if (ctx->ring_fds.oob_wake_read >= 0) {
+      close(ctx->ring_fds.oob_wake_read);
+      ctx->ring_fds.oob_wake_read = -1;
    }
 
    return true;
@@ -839,13 +1273,26 @@ proxy_context_create(uint32_t ctx_id,
    ctx->client = client;
    proxy_socket_init(&ctx->socket, ctx_fd);
    ctx->capset_id = capset_id;
-   ctx->fence_socket_fd = -1;
    ctx->shmem.fd = -1;
+   ctx->status_fd = -1;
    mtx_init(&ctx->timeline_mutex, mtx_plain);
+   mtx_init(&ctx->ring_mutex, mtx_plain);
    mtx_init(&ctx->free_fences_mutex, mtx_plain);
    list_inithead(&ctx->free_fences);
    ctx->sync_thread.fence_eventfd = -1;
    ctx->sync_thread.fence_eventfd_write = -1;
+   ctx->has_oob_ring = capset_id == VIRTGPU_DRM_CAPSET_NEPTUNE;
+   ctx->main_wake_write = -1;
+   ctx->oob_wake_write = -1;
+   ctx->death_read_fd = -1;
+   ctx->ring_fds.completion_write = -1;
+   ctx->ring_fds.main_wake_read = -1;
+   ctx->ring_fds.death_write = -1;
+   ctx->ring_fds.oob_wake_read = -1;
+   ctx->ring_stats_enabled = getenv("VIRGL_PROXY_RING_STATS") != NULL;
+   ctx->lat_trace_dir = getenv("VIRGL_LATENCY_TRACE");
+   ctx->lat_trace_enabled =
+      ctx->lat_trace_dir && ctx->lat_trace_dir[0];
 
    if (capset_id == VIRTGPU_DRM_CAPSET_NEPTUNE)
       ctx->work_context = npt_work_context_client_create(ctx_id, worker_pid,

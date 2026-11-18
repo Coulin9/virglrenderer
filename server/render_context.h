@@ -12,6 +12,8 @@
 
 #include "c11/threads.h"
 
+#include "render_ring.h"
+
 enum render_backend_type {
    RENDER_BACKEND_NONE = 0,
    RENDER_BACKEND_VENUS,
@@ -29,21 +31,38 @@ struct render_context {
    int shmem_fd;
    size_t shmem_size;
    void *shmem_ptr;
-   atomic_uint *shmem_timelines;
+   struct render_ring_control *ring; /* == shmem_ptr */
+   struct render_ring_buf main_ring;
+   struct render_ring_oob oob_ring;
+   uint32_t ring_flags; /* RENDER_RING_FLAG_* */
+   bool ring_ready;     /* INIT processed; run loop is in ring mode */
 
    int timeline_count;
 
    enum render_backend_type backend;
 
-   /* optional */
+   /* write end of the completion wake channel (eventfd/pipe) handed over
+    * by INIT; signalled per the conditional-wake state machine, or always
+    * when ring_flags has RENDER_RING_FLAG_ALWAYS_NOTIFY */
    int fence_eventfd;
 
-   /* optional out-of-band fence channel (RENDER_CONTEXT_OP_ATTACH_FENCE_SOCKET):
-    * a dedicated thread reads submit_fence records off fence_socket_fd and
-    * registers them without queueing behind the dispatch thread. */
-   int fence_socket_fd;
-   thrd_t fence_thread;
-   bool fence_thread_created;
+   /* read ends of the main/oob ring wake channels and the write end of
+    * the death pipe (never written; closed on worker exit) */
+   int main_wake_read;
+   int oob_wake_read;
+   int death_write_fd;
+
+   /* out-of-band fence ring consumer: a dedicated thread registers
+    * arrival-order-tolerant fences without queueing behind the dispatch
+    * loop's in-flight submits */
+   thrd_t oob_thread;
+   bool oob_thread_created;
+   int oob_stop_read;
+   int oob_stop_write;
+
+   /* env-gated per-fence latency trace: shared record + seqmap area
+    * after the rings; the worker resolves fence_ids through it */
+   struct render_ring_lat_area *lat; /* NULL when disabled */
 };
 
 struct render_context_args {

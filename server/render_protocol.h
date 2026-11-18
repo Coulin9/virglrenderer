@@ -43,7 +43,6 @@ enum render_context_op {
    RENDER_CONTEXT_OP_DESTROY_RESOURCE,
    RENDER_CONTEXT_OP_SUBMIT_CMD,
    RENDER_CONTEXT_OP_SUBMIT_FENCE,
-   RENDER_CONTEXT_OP_ATTACH_FENCE_SOCKET,
 
    RENDER_CONTEXT_OP_COUNT,
 };
@@ -124,21 +123,34 @@ struct render_context_op_nop_request {
 
 /* Initialize the context.
  *
- * The shmem is required and currently holds an array of atomic_uint.  Each
- * atomic_uint represents the current sequence number of a ring (as defined by
- * the virtio-gpu spec).
+ * The shmem is required and holds the shared submit ring region described
+ * by server/render_ring.h: a render_ring_control block (timeline seqnos,
+ * ring cursors, consumer states, flags and stats) followed by the main
+ * byte ring and, when oob_ring_size is non-zero, the out-of-band fence
+ * slot ring.  When ring_flags has RENDER_RING_FLAG_LATENCY_TRACE, a
+ * render_ring_lat_area follows the rings at lat_ring_offset.
  *
- * The eventfd is optional.  When given, it will be written to when there are
- * changes to any of the sequence numbers.
+ * ring_flags carries RENDER_RING_FLAG_* bits; in particular
+ * RENDER_RING_FLAG_ALWAYS_NOTIFY asks the worker to signal the completion
+ * wake fd on every timeline update (non-ASYNC_FENCE_CB clients).
  *
  * This roughly corresponds to virgl_renderer_context_create_with_flags.
  */
 struct render_context_op_init_request {
    struct render_context_op_header header;
    uint32_t flags; /* VIRGL_RENDERER_CONTEXT_FLAG_*/
+   uint32_t ring_flags; /* RENDER_RING_FLAG_* */
    size_t shmem_size;
+   uint32_t main_ring_offset;
+   uint32_t main_ring_size;
+   uint32_t oob_ring_offset;
+   uint32_t oob_ring_size; /* 0 = no out-of-band fence ring */
+   uint32_t lat_ring_offset; /* 0 = no latency trace area */
+   uint32_t lat_ring_size;
    struct npt_work_context_config work_context;
-   /* followed by 1 shmem fd and optionally 1 eventfd */
+   /* followed by, in order: shmem fd, completion-wake write end,
+    * main-ring wake read end, death-pipe write end, and (only when
+    * oob_ring_size != 0) the oob-ring wake read end. */
 };
 
 /* Export a blob resource from the context
@@ -228,24 +240,6 @@ struct render_context_op_submit_fence_request {
    uint32_t seqno;
 };
 
-/* Attach a side channel dedicated to fence submission.
- *
- * One fd follows via SCM_RIGHTS: a SOCK_STREAM socket whose payload is a
- * stream of fixed-size render_context_op_submit_fence_request records.  A
- * dedicated server thread reads and registers them immediately, so a fence
- * never queues behind the dispatch thread's in-flight submits (whose
- * processing can take milliseconds, or park outright in a ring wait).
- *
- * Only fences whose retirement is arrival-order-tolerant may travel this
- * channel.  For Neptune those are the event-ring fences (upper half of the
- * timeline range): the host pairs them with ARM commands and explicitly
- * parks whichever side arrives first.  Low rings retire in dispatch order
- * ("everything before me was consumed") and must stay on the main socket.
- */
-struct render_context_op_attach_fence_socket_request {
-   struct render_context_op_header header;
-};
-
 union render_context_op_request {
    struct render_context_op_header header;
    struct render_context_op_nop_request nop;
@@ -255,7 +249,6 @@ union render_context_op_request {
    struct render_context_op_destroy_resource_request destroy_resource;
    struct render_context_op_submit_cmd_request submit_cmd;
    struct render_context_op_submit_fence_request submit_fence;
-   struct render_context_op_attach_fence_socket_request attach_fence_socket;
 };
 
 #ifdef __APPLE__

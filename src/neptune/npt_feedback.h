@@ -95,6 +95,7 @@ struct npt_feedback_entry {
    bool persistent;
    bool pending;
    bool rewound;
+   bool live;
    struct list_head pending_head;
 };
 
@@ -242,5 +243,14 @@ void npt_feedback_fence_register(struct npt_context *ctx,
 void npt_feedback_fence_mark_signal(struct npt_context *ctx,
                                     void *host_fence,
                                     uint64_t value);
+
+/* Publish the fence's current host GetCompletedValue into its feedback
+ * slot immediately, under the same state lock the poller uses, with the
+ * same rewind latch (plus the slot's REWOUND flag).  Called on the
+ * points where freshness matters -- right after a host Signal and
+ * before an armed event retires -- so the guest's slot read is
+ * authoritative-current rather than up to one poll interval stale.
+ * No-op for unregistered fences. */
+void npt_feedback_fence_refresh(struct npt_context *ctx, void *host_fence);
 
 #endif /* NPT_FEEDBACK_H */

@@ -640,9 +640,26 @@ struct npt_cmd_query_end {
 #define NPT_FENCE_FEEDBACK_API_D3D11  11u
 #define NPT_FENCE_FEEDBACK_API_D3D12  12u
 
+#define NPT_FENCE_FEEDBACK_FLAG_REWOUND 1u
+#define NPT_FENCE_FEEDBACK_FLAG_LIVE 2u
+
 struct npt_d3d11_fence_feedback_slot {
    _Atomic uint64_t completed_value;
-   uint64_t pad;
+   _Atomic uint64_t flags;
+};
+
+#define NPT_CONTEXT_STATUS_BLOB_ID   UINT64_C(0xFFFFFFFFFFFFFF01)
+#define NPT_CONTEXT_STATUS_PAGE_SIZE 16384u
+#define NPT_CONTEXT_STATUS_MAGIC     0x5354504eu
+#define NPT_CONTEXT_STATUS_VERSION   1u
+#define NPT_CONTEXT_STATUS_LOST_WORKER_EXIT 1u
+
+struct npt_context_status_page {
+   uint32_t magic;
+   uint32_t version;
+   _Atomic uint32_t lost;
+   uint32_t pad0;
+   _Atomic uint64_t lost_ns;
 };
 
 struct npt_cmd_register_fence_feedback {

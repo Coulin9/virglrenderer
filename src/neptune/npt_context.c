@@ -157,6 +157,7 @@ npt_context_init_dispatch(struct npt_context *ctx)
    d->id3d12commandqueue_dispatch_overrides =
       &npt_id3d12commandqueue_overrides;
    d->id3d12fence_dispatch_overrides = &npt_id3d12fence_overrides;
+   d->id3d12device1_dispatch_overrides = &npt_id3d12device1_overrides;
 }
 
 /* `id` is the guest-minted handle; `host_ptr` the host-library pointer

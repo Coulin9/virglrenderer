@@ -15,8 +15,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "npt_com.h"
 #include "npt_context.h"
 #include "npt_event.h"
+#include "npt_feedback.h"
 #include "npt_profile.h"
 #include "util/u_thread.h"
 
@@ -94,6 +96,21 @@ npt_queue_free_sync(struct npt_queue_sync *sync)
 static inline void
 npt_queue_sync_retire(struct npt_queue *queue, struct npt_queue_sync *sync)
 {
+   /* Publish each armed fence's freshest completed value into its
+    * feedback slot before the guest can observe the retirement. */
+   if (sync->check_fence)
+      npt_feedback_fence_refresh(queue->context, sync->check_fence);
+   if (sync->release_proxy) {
+      uint32_t count;
+      void **fences =
+         npt_event_take_seoc_fences(queue->context, sync->release_proxy, &count);
+      for (uint32_t i = 0; i < count; i++) {
+         npt_feedback_fence_refresh(queue->context, fences[i]);
+         npt_com_release(fences[i]);
+      }
+      free(fences);
+   }
+
    queue->context->retire_fence(queue->context->ctx_id,
                                  sync->ring_idx, sync->fence_id);
    /* The arm's proxy reference was transferred to this entry at

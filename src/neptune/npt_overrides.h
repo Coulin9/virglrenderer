@@ -54,5 +54,7 @@ extern struct npt_dispatch_id3d12commandqueue_overrides
    npt_id3d12commandqueue_overrides;
 extern struct npt_dispatch_id3d12fence_overrides
    npt_id3d12fence_overrides;
+extern struct npt_dispatch_id3d12device1_overrides
+   npt_id3d12device1_overrides;
 
 #endif /* NPT_OVERRIDES_H */

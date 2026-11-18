@@ -8,6 +8,8 @@
 
 #include "proxy_common.h"
 #include "neptune/npt_work_context.h"
+#include "server/render_ring.h"
+#include "proxy_status_page.h"
 
 #include "c11/threads.h"
 #include "virgl_context.h"
@@ -21,8 +23,6 @@ struct proxy_timeline {
    uint32_t cur_seqno;
    uint32_t next_seqno;
    struct list_head fences;
-
-   int cur_seqno_stall_count;
 };
 
 struct proxy_context {
@@ -35,17 +35,48 @@ struct proxy_context {
    void *work_context;
    struct npt_work_context_config work_context_config;
 
-   /* Out-of-band fence channel (RENDER_CONTEXT_OP_ATTACH_FENCE_SOCKET):
-    * write end of a socketpair whose read end a dedicated server thread
-    * drains, so arrival-order-tolerant fences (Neptune event rings)
-    * register without queueing behind the worker's dispatch backlog.
-    * -1 = not attached yet, -2 = attach failed / channel dead (all
-    * fences then take the synchronous main-socket path).  Written only
-    * from the submit_fence caller thread. */
-   int fence_socket_fd;
+   /* Shared submit ring (server/render_ring.h): replaces the per-op
+    * socket traffic and the fence socket.  The socket is kept for INIT,
+    * SOCKET_REQUEST-covered cold ops and oversized command payloads. */
+   mtx_t ring_mutex; /* guards all ring writes and socket request order */
+   struct render_ring_control *ring; /* == shmem.ptr */
+   struct render_ring_buf main_ring;
+   struct render_ring_oob oob_ring;
+   bool has_oob_ring;
+   _Atomic bool worker_dead;
+   int main_wake_write; /* VMM-held write end; worker holds the read end */
+   int oob_wake_write;  /* -1 when no oob ring */
+   int death_read_fd;   /* readable/HUP once the worker exits */
+
+   /* the worker's ends of the ring pipes, held only until INIT passes
+    * them over SCM_RIGHTS (a dup when the platform gives one fd for both
+    * ends of a channel) */
+   struct {
+      int completion_write;
+      int main_wake_read;
+      int death_write;
+      int oob_wake_read;
+   } ring_fds;
+
+   bool ring_stats_enabled;
+
+   /* env-gated per-fence latency trace (VIRGL_LATENCY_TRACE=<dir>): the
+    * shared region then carries a render_ring_lat_area this context
+    * stamps on submit/retire; dumped to <dir> at destroy */
+   bool lat_trace_enabled;
+   const char *lat_trace_dir;
+   struct render_ring_lat_area *lat; /* NULL when disabled */
+   uint64_t lat_vmm_wake_ts;         /* sync thread: last poll() return */
 
    /* this tracks resources early attached in get_blob */
    struct hash_table *resource_table;
+
+   /* the guest status page (NPT_CONTEXT_STATUS_BLOB_ID): owned by the
+    * proxy, never forwarded to the worker.  status_resource_table holds
+    * the res_ids it was handed out under. */
+   _Atomic(struct npt_context_status_page *) status_page;
+   int status_fd;
+   struct hash_table *status_resource_table;
 
    /* this is shared with the render worker */
    struct {
@@ -57,7 +88,7 @@ struct proxy_context {
    mtx_t timeline_mutex;
    struct proxy_timeline timelines[PROXY_CONTEXT_TIMELINE_COUNT];
    /* which timelines have fences */
-   uint64_t timeline_busy_mask;
+   _Atomic uint64_t timeline_busy_mask;
    /* this points a region of shmem updated by the render worker */
    const volatile atomic_uint *timeline_seqnos;
 

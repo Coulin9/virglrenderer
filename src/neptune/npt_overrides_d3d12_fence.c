@@ -18,6 +18,7 @@
 
 #include "neptune-protocol/npt_protocol_host_dispatch_types.h"
 #include "neptune-protocol/npt_protocol_host_id3d12commandqueue.h"
+#include "neptune-protocol/npt_protocol_host_id3d12device.h"
 #include "neptune-protocol/npt_protocol_host_id3d12fence.h"
 
 /* ---- GATE_WAIT bridge ---------------------------------------------------- */
@@ -112,9 +113,59 @@ npt_override_ID3D12Fence_Signal(
    args->ret = original(args->_self, args->Value);
 
    if (NPT_SUCCEEDED(args->ret)) {
-      npt_feedback_fence_mark_signal(npt_context_from_dispatch(dctx),
-                                     args->_self, args->Value);
+      struct npt_context *ctx = npt_context_from_dispatch(dctx);
+      npt_feedback_fence_mark_signal(ctx, args->_self, args->Value);
+      /* CPU Signal completes before original returns, so the slot is
+       * current by the time the reply reaches the guest. */
+      npt_feedback_fence_refresh(ctx, args->_self);
    }
+   return args->ret;
+}
+
+static HRESULT
+npt_override_ID3D12Fence_SetEventOnCompletion(
+   struct npt_dispatch_context *dctx,
+   struct npt_command_ID3D12Fence_SetEventOnCompletion *args,
+   PFN_ID3D12Fence_SetEventOnCompletion original)
+{
+   /* Recorded before the arm: the backend may signal the proxy inside
+    * original() when the fence already reached Value, and the sync queue
+    * must find the fence to refresh its slot.  Rolled back on failure. */
+   struct npt_event_proxy *pr = NULL;
+   struct npt_context *ctx = npt_context_from_dispatch(dctx);
+   if (args->hEvent) {
+      pr = npt_event_command_proxy();
+      if (pr)
+         npt_event_note_seoc_fences(ctx, pr, &args->_self, 1);
+   }
+
+   args->ret = original(args->_self, args->Value, args->hEvent);
+
+   if (pr && !NPT_SUCCEEDED(args->ret))
+      npt_event_drop_seoc_fences(ctx, pr);
+   return args->ret;
+}
+
+static HRESULT
+npt_override_ID3D12Device1_SetEventOnMultipleFenceCompletion(
+   struct npt_dispatch_context *dctx,
+   struct npt_command_ID3D12Device1_SetEventOnMultipleFenceCompletion *args,
+   PFN_ID3D12Device1_SetEventOnMultipleFenceCompletion original)
+{
+   struct npt_event_proxy *pr = NULL;
+   struct npt_context *ctx = npt_context_from_dispatch(dctx);
+   if (args->hEvent) {
+      pr = npt_event_command_proxy();
+      if (pr)
+         npt_event_note_seoc_fences(ctx, pr, (void *const *)args->ppFences,
+                                    args->NumFences);
+   }
+
+   args->ret = original(args->_self, args->ppFences, args->pFenceValues,
+                        args->NumFences, args->Flags, args->hEvent);
+
+   if (pr && !NPT_SUCCEEDED(args->ret))
+      npt_event_drop_seoc_fences(ctx, pr);
    return args->ret;
 }
 
@@ -125,5 +176,11 @@ npt_id3d12commandqueue_overrides = {
 };
 
 struct npt_dispatch_id3d12fence_overrides npt_id3d12fence_overrides = {
+   .SetEventOnCompletion = npt_override_ID3D12Fence_SetEventOnCompletion,
    .Signal = npt_override_ID3D12Fence_Signal,
+};
+
+struct npt_dispatch_id3d12device1_overrides npt_id3d12device1_overrides = {
+   .SetEventOnMultipleFenceCompletion =
+      npt_override_ID3D12Device1_SetEventOnMultipleFenceCompletion,
 };

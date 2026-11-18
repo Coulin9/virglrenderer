@@ -21,7 +21,21 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 #
 
-check_dep = dependency('check')
+check_dep = dependency('check', required : false)
+
+# The render-ring tests are self-contained (the helpers are header-only)
+# and do not need check, so they build regardless.
+ring_tests = [
+   ['test_render_ring', 'test_render_ring.c'],
+]
+
+foreach t : ring_tests
+   test_ring = executable(t[0], t[1],
+                          include_directories : include_directories('..'))
+   test(t[0], test_ring)
+endforeach
+
+if check_dep.found()
 
 libvrtest_sources = [
    'testvirgl.c',
@@ -114,6 +128,8 @@ if with_valgrind
    endforeach
 endif
 
+endif # check_dep.found()
+
 if with_fuzzer
    subdir('fuzzer')
 endif
@@ -128,6 +144,7 @@ if with_neptune
    neptune_tests = [
       ['test_neptune_init', 'test_neptune_init.c'],
       ['test_neptune_async_create', 'test_neptune_async_create.c'],
+      ['test_neptune_status_page', 'test_neptune_status_page.c'],
    ]
 
    # Neptune init forks the render server, so point at the in-tree

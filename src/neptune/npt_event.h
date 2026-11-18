@@ -38,6 +38,14 @@ struct npt_event_proxy {
     * doesn't hit EBADF and the in-flight dup_fd can still observe
     * the signal. */
    uint32_t refcount;
+   /* Host fences armed through ID3D12Fence::SetEventOnCompletion or
+    * ID3D12Device1::SetEventOnMultipleFenceCompletion on this proxy's
+    * signal handle; single-use tokens make them unambiguous.  The sync
+    * queue refreshes their feedback slots before retiring the paired
+    * fence.  Owns an IUnknown reference to each until
+    * npt_event_take_seoc_fences consumes them or the proxy dies. */
+   void **seoc_fences;
+   uint32_t seoc_fence_count;
 };
 
 struct npt_event_pending_arm {
@@ -136,6 +144,29 @@ void npt_event_drain_parked_ring(struct npt_context *ctx, uint32_t ring_idx);
  * current command.  Call after every dispatched command, on the decode
  * thread that ran it. */
 void npt_event_unpin_dispatched(struct npt_context *ctx);
+
+/* The proxy whose signal handle the current command's decode
+ * substituted (last npt_event_replace_by_token hit on this thread),
+ * or NULL.  Only meaningful between decode and unpin. */
+struct npt_event_proxy *npt_event_command_proxy(void);
+
+/* Record the host fences a SetEventOnCompletion dispatch arms on this
+ * proxy's signal handle.  Each takes its own IUnknown reference, replacing
+ * any previous recording.  Must run before the arm reaches the backend. */
+void npt_event_note_seoc_fences(struct npt_context *ctx,
+                                struct npt_event_proxy *pr,
+                                void *const *fences, uint32_t count);
+
+/* Consume the recorded fences: returns the array with each proxy
+ * reference transferred to the caller, who releases every entry and
+ * frees the array (NULL when none was recorded). */
+void **npt_event_take_seoc_fences(struct npt_context *ctx,
+                                  struct npt_event_proxy *pr,
+                                  uint32_t *count);
+
+/* Undo a recording whose arm the backend rejected. */
+void npt_event_drop_seoc_fences(struct npt_context *ctx,
+                                struct npt_event_proxy *pr);
 
 struct npt_dispatch_context;
 void *npt_event_replace_by_token(struct npt_dispatch_context *dispatch,
