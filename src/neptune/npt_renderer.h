@@ -79,6 +79,12 @@ npt_renderer_submit_fence(uint32_t ctx_id,
                           uint64_t ring_idx,
                           uint64_t fence_id);
 
+/* Doorbell-kick a ring by id: the same notify the RING_NOTIFY command
+ * applies, but without a command dispatch.  Called from the worker's
+ * OOB consumer thread.  Returns false when the ring doesn't exist. */
+bool
+npt_renderer_ring_doorbell(uint32_t ctx_id, uint32_t ring_id);
+
 bool
 npt_renderer_create_resource(uint32_t ctx_id,
                              uint32_t res_id,

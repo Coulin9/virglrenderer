@@ -200,6 +200,19 @@ union render_ring_line {
    uint8_t _pad[RENDER_RING_CACHELINE];
 };
 
+/* MMIO doorbell bitmask: the VMM sets bit ring_id for each ring the
+ * guest kicked; the worker's OOB consumer exchanges the words to zero
+ * and fires a per-ring notify.  Guest ring ids are small counters that
+ * in practice stay well below the mask width; ids beyond it keep the
+ * RING_NOTIFY command path. */
+#define RENDER_RING_DOORBELL_MASK_WORDS 2
+#define RENDER_RING_DOORBELL_MAX_RINGS (RENDER_RING_DOORBELL_MASK_WORDS * 64)
+
+union render_ring_doorbell {
+   _Atomic uint64_t mask[RENDER_RING_DOORBELL_MASK_WORDS];
+   uint8_t _pad[RENDER_RING_CACHELINE];
+};
+
 struct render_ring_control {
    /* written by the worker, read by the VMM sync thread */
    atomic_uint timelines[RENDER_RING_TIMELINE_COUNT];
@@ -214,6 +227,11 @@ struct render_ring_control {
 
    union render_ring_line vmm_state;  /* VMM sync-thread state */
    union render_ring_line flags;      /* RENDER_RING_FLAG_* */
+
+   /* MMIO doorbell bits, VMM-written, drained by the worker's OOB
+    * consumer under the same conditional-wake state machine as the OOB
+    * ring itself (oob_state + oob wake). */
+   union render_ring_doorbell doorbell;
 
    union {
       struct render_ring_stats_vmm v;
@@ -783,5 +801,52 @@ render_ring_consumer_wait_fd(atomic_uint *state,
    return RENDER_RING_WAIT_WORK; /* spurious edge; re-drain to be safe */
 }
 #endif /* !__APPLE__ */
+
+/* ------------------------------------------------------------------ */
+/* doorbell bitmask (shared with the OOB consumer's wake domain)       */
+
+static inline bool
+render_ring_doorbell_pending(const struct render_ring_control *ctl)
+{
+   for (uint32_t w = 0; w < RENDER_RING_DOORBELL_MASK_WORDS; w++) {
+      if (atomic_load_explicit(&ctl->doorbell.mask[w], memory_order_acquire))
+         return true;
+   }
+   return false;
+}
+
+/* Producer side (VMM, called under the proxy slot's read lock so the
+ * shared region can't be unmapped mid-store).  Follows the conditional
+ * -wake producer rule: bit publish, seq_cst fence, then one signal only
+ * if the OOB consumer is SLEEPING. */
+static inline void
+render_ring_doorbell_set(struct render_ring_control *ctl,
+                         uint32_t ring_id,
+                         render_wake_t oob_wake)
+{
+   atomic_fetch_or_explicit(&ctl->doorbell.mask[ring_id >> 6],
+                            UINT64_C(1) << (ring_id & 63),
+                            memory_order_relaxed);
+   atomic_thread_fence(memory_order_seq_cst);
+   render_ring_producer_wake(&ctl->oob_state.value, oob_wake, NULL);
+}
+
+/* Consumer side (worker OOB thread): swap every mask word with zero and
+ * invoke cb once per set bit, in id order. */
+static inline void
+render_ring_doorbell_drain(struct render_ring_control *ctl,
+                           void (*cb)(void *opaque, uint32_t ring_id),
+                           void *opaque)
+{
+   for (uint32_t w = 0; w < RENDER_RING_DOORBELL_MASK_WORDS; w++) {
+      uint64_t m = atomic_exchange_explicit(&ctl->doorbell.mask[w], 0,
+                                            memory_order_acq_rel);
+      while (m) {
+         const uint32_t bit = (uint32_t)__builtin_ctzll(m);
+         m &= m - 1;
+         cb(opaque, w * 64 + bit);
+      }
+   }
+}
 
 #endif /* RENDER_RING_H */

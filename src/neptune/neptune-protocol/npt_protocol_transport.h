@@ -670,6 +670,10 @@ struct npt_d3d11_fence_feedback_slot {
 #define NPT_CONTEXT_STATUS_VERSION   2u
 #define NPT_CONTEXT_STATUS_LOST_WORKER_EXIT 1u
 
+/* MMIO doorbell: guest writes ring_id to its context slot; ids at or
+ * beyond the host's mask width keep the RING_NOTIFY command path. */
+#define NPT_DOORBELL_MAX_RINGS 128u
+
 /* Single-producer / single-consumer token queue used for Win32 event
  * completion.  Each field lives on its own cache line and has exactly
  * one writer: the first 128 bytes are VMM-written, evt_tail and

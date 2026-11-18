@@ -16,6 +16,7 @@
 #include "neptune-protocol/npt_protocol_defs.h"
 #include "neptune_hw.h"
 #include "npt_context.h"
+#include "npt_ring.h"
 #include "npt_work_context.h"
 #include "npt_library.h"
 #include "npt_profile.h"
@@ -344,6 +345,30 @@ npt_renderer_submit_fence(uint32_t ctx_id,
    }
 
    return npt_context_submit_fence(ctx, (uint32_t)ring_idx, fence_id);
+}
+
+bool
+npt_renderer_ring_doorbell(uint32_t ctx_id, uint32_t ring_id)
+{
+   struct npt_context *ctx = npt_renderer_lookup_context(ctx_id);
+   if (!ctx)
+      return false;
+
+   /* Find + notify under ring_mutex: DESTROY_RING removes and frees a
+    * ring under the same lock, so a ring pointer found here stays
+    * valid until we drop it (unlike find_by_id, whose caller must be
+    * serialized with DESTROY_RING). */
+   bool found = false;
+   mtx_lock(&ctx->ring_mutex);
+   list_for_each_entry(struct npt_ring, ring, &ctx->rings, head) {
+      if (ring->id == ring_id) {
+         npt_ring_notify(ring);
+         found = true;
+         break;
+      }
+   }
+   mtx_unlock(&ctx->ring_mutex);
+   return found;
 }
 
 bool

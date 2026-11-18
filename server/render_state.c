@@ -355,6 +355,24 @@ render_state_submit_fence(uint32_t ctx_id,
 }
 
 bool
+render_state_ring_doorbell(uint32_t ctx_id, uint32_t ring_id)
+{
+   struct render_context *ctx = render_state_lookup_context(ctx_id);
+   if (!ctx)
+      return false;
+
+   SCOPE_LOCK_RENDERER();
+   switch (ctx->backend) {
+#ifdef ENABLE_NEPTUNE
+   case RENDER_BACKEND_NEPTUNE:
+      return npt_renderer_ring_doorbell(ctx_id, ring_id);
+#endif
+   default:
+      return false;
+   }
+}
+
+bool
 render_state_create_resource(uint32_t ctx_id,
                              uint32_t res_id,
                              uint64_t blob_id,

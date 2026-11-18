@@ -135,6 +135,7 @@ render_context_dispatch_submit_fence(struct render_context *ctx,
 
 struct render_context_oob_consumer {
    const struct render_ring_oob *r;
+   struct render_ring_control *ctl;
    uint32_t head;
 };
 
@@ -142,7 +143,15 @@ static bool
 render_context_oob_has_work(void *opaque)
 {
    const struct render_context_oob_consumer *c = opaque;
-   return atomic_load_explicit(c->r->tail, memory_order_acquire) != c->head;
+   return atomic_load_explicit(c->r->tail, memory_order_acquire) != c->head ||
+          render_ring_doorbell_pending(c->ctl);
+}
+
+static void
+render_context_oob_doorbell_cb(void *opaque, uint32_t ring_id)
+{
+   struct render_context *ctx = opaque;
+   render_state_ring_doorbell(ctx->ctx_id, ring_id);
 }
 
 /* Out-of-band fence ring consumer (replaces the fence socket thread):
@@ -157,6 +166,7 @@ render_context_oob_thread(void *arg)
 
    struct render_context_oob_consumer consumer = {
       .r = &ctx->oob_ring,
+      .ctl = ctx->ring,
       .head = 0,
    };
 
@@ -188,6 +198,12 @@ render_context_oob_thread(void *arg)
       render_ring_oob_commit(&ctx->oob_ring, consumer.head);
       if (bad)
          break;
+
+      /* MMIO doorbells share this consumer's wake domain: drain the
+       * mask after the fence slots so a bit can't be picked up while
+       * oob_state still reads ACTIVE between iterations. */
+      render_ring_doorbell_drain(ctx->ring,
+                                 render_context_oob_doorbell_cb, ctx);
 
 #if defined(__APPLE__)
       const enum render_ring_wait_result res = render_ring_consumer_wait(

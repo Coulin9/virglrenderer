@@ -335,6 +335,14 @@ VIRGL_EXPORT int virgl_renderer_submit_cmd(void *buffer,
                                            int ctx_id,
                                            int ndw);
 
+/* Direct low-latency ring kick for Neptune contexts, invoked by the
+ * VMM from a vCPU thread that handled a guest MMIO doorbell write.
+ * Thread-safe, takes no global renderer lock.  Returns -EINVAL for an
+ * unknown or non-Neptune ctx_id and for a ring_id beyond the doorbell
+ * mask width (the guest keeps the RING_NOTIFY command as fallback). */
+VIRGL_EXPORT int virgl_renderer_context_doorbell(uint32_t ctx_id,
+                                                 uint32_t ring_id);
+
 VIRGL_EXPORT int virgl_renderer_transfer_read_iov(uint32_t handle, uint32_t ctx_id,
                                                   uint32_t level, uint32_t stride,
                                                   uint32_t layer_stride,

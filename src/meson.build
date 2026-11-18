@@ -178,6 +178,7 @@ proxy_sources = [
    'proxy/proxy_client.c',
    'proxy/proxy_common.c',
    'proxy/proxy_context.c',
+   'proxy/proxy_doorbell.c',
    'proxy/proxy_renderer.c',
    'proxy/proxy_server.c',
    'proxy/proxy_socket.c',

@@ -45,6 +45,13 @@ if host_machine.system() == 'darwin'
    test('test_proxy_monitor', test_proxy_monitor)
 endif
 
+test_npt_doorbell = executable(
+   'test_npt_doorbell',
+   ['test_npt_doorbell.c', '../src/proxy/proxy_doorbell.c'],
+   include_directories : include_directories(
+      '..', '../src', '../src/mesa/compat'))
+test('test_npt_doorbell', test_npt_doorbell)
+
 if check_dep.found()
 
 libvrtest_sources = [

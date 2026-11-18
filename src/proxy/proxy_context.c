@@ -24,6 +24,7 @@
 #include "virgl_fence.h"
 
 #include "proxy_client.h"
+#include "proxy_doorbell.h"
 #include "neptune/npt_work_context.h"
 
 /* Wake primitives and the worker-exit path differ per platform: macOS
@@ -1043,6 +1044,12 @@ static void
 proxy_context_destroy(struct virgl_context *base)
 {
    struct proxy_context *ctx = (struct proxy_context *)base;
+
+   /* Detach the MMIO doorbell slot first: a vCPU ringer holds the
+    * slot's read lock while it touches the shared mask and the OOB
+    * wake, so the slot must read empty before either is torn down. */
+   proxy_doorbell_unregister(ctx->base.ctx_id);
+
    npt_work_context_client_destroy(ctx->work_context);
 
 #if defined(__APPLE__)
@@ -1472,6 +1479,12 @@ proxy_context_create(uint32_t ctx_id,
       proxy_context_destroy(&ctx->base);
       return NULL;
    }
+
+   /* Expose the context's ring-shm doorbell mask and OOB wake to the
+    * MMIO doorbell slot (Neptune only; ctx_ids >= slot count get no
+    * doorbell). */
+   if (ctx->has_oob_ring && ctx_id < PROXY_DOORBELL_SLOT_COUNT)
+      proxy_doorbell_register(ctx_id, ctx->ring, proxy_context_oob_wake(ctx));
 
    return &ctx->base;
 }

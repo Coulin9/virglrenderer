@@ -33,6 +33,9 @@ render_state_submit_fence(uint32_t ctx_id,
                           uint64_t fence_id);
 
 bool
+render_state_ring_doorbell(uint32_t ctx_id, uint32_t ring_id);
+
+bool
 render_state_create_resource(uint32_t ctx_id,
                              uint32_t res_id,
                              uint64_t blob_id,

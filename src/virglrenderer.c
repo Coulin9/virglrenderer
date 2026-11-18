@@ -44,6 +44,7 @@
 #include "util/u_math.h"
 #include "vkr_allocator.h"
 #include "drm_renderer.h"
+#include "proxy/proxy_doorbell.h"
 #include "proxy/proxy_renderer.h"
 #include "vrend/vrend_renderer.h"
 #include "vrend/vrend_winsys.h"
@@ -303,6 +304,12 @@ void virgl_renderer_context_destroy(uint32_t handle)
 {
    TRACE_FUNC();
    virgl_context_remove(handle);
+}
+
+int virgl_renderer_context_doorbell(uint32_t ctx_id, uint32_t ring_id)
+{
+   TRACE_FUNC();
+   return proxy_doorbell_ring(ctx_id, ring_id);
 }
 
 int virgl_renderer_submit_cmd(void *buffer,
