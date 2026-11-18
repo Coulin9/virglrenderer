@@ -10,6 +10,7 @@
 #include "neptune/npt_work_context.h"
 #include "server/render_ring.h"
 #include "proxy_status_page.h"
+#include "proxy_worker.h"
 
 #include "c11/threads.h"
 #include "virgl_context.h"
@@ -44,6 +45,15 @@ struct proxy_context {
    struct render_ring_oob oob_ring;
    bool has_oob_ring;
    _Atomic bool worker_dead;
+
+#if defined(__APPLE__)
+   /* Direct-spawned worker: the VMM creates and owns all three wake
+    * semaphores, hands them to the child as registered ports, and
+    * learns of worker exit from the process-wide EVFILT_PROC monitor
+    * (worker_dead above). */
+   struct proxy_worker worker;
+   bool worker_death_handled; /* sync thread ran the death path */
+#else
    int main_wake_write; /* VMM-held write end; worker holds the read end */
    int oob_wake_write;  /* -1 when no oob ring */
    int death_read_fd;   /* readable/HUP once the worker exits */
@@ -57,6 +67,7 @@ struct proxy_context {
       int death_write;
       int oob_wake_read;
    } ring_fds;
+#endif
 
    bool ring_stats_enabled;
 
@@ -96,6 +107,7 @@ struct proxy_context {
    struct list_head free_fences;
 
    struct {
+#if !defined(__APPLE__)
       /* when VIRGL_RENDERER_THREAD_SYNC is set: the fence signalling
        * channel from create_fence_pipe().  fence_eventfd is the end we
        * poll/drain; fence_eventfd_write is the end the render worker (and
@@ -103,6 +115,7 @@ struct proxy_context {
        * eventfd; on macOS they are the two ends of a pipe. */
       int fence_eventfd;
       int fence_eventfd_write;
+#endif
 
       /* when VIRGL_RENDERER_ASYNC_FENCE_CB is also set */
       thrd_t thread;

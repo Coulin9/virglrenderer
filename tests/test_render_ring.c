@@ -13,11 +13,26 @@
 #include "server/render_ring.h"
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <spawn.h>
+
+/* Not declared by the SDK <spawn.h>; exported by libSystem. */
+extern int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *,
+                                                   const mach_port_t *,
+                                                   uint32_t);
+#else
+#include <sys/eventfd.h>
+#endif
 
 static int failures;
 
@@ -30,24 +45,6 @@ static int failures;
          failures++;                                                           \
       }                                                                        \
    } while (0)
-
-static int
-make_pipe(int fds[2])
-{
-   if (pipe(fds))
-      return -1;
-   for (int i = 0; i < 2; i++) {
-      const int fdflags = fcntl(fds[i], F_GETFD);
-      const int stflags = fcntl(fds[i], F_GETFL);
-      if (fdflags < 0 || fcntl(fds[i], F_SETFD, fdflags | FD_CLOEXEC) ||
-          stflags < 0 || fcntl(fds[i], F_SETFL, stflags | O_NONBLOCK))
-         return -1;
-   }
-#ifdef F_SETNOSIGPIPE
-   fcntl(fds[1], F_SETNOSIGPIPE, 1);
-#endif
-   return 0;
-}
 
 struct test_region {
    struct render_ring_control *ctl;
@@ -278,13 +275,39 @@ test_encode_decode(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* two-process stress test                                             */
+/* wake primitive helpers                                              */
 
-#define STRESS_ENTRIES 1000000
-#define STRESS_MAX_PAYLOAD 4096
-#define STRESS_COMPLETIONS 200000
+static render_wake_t
+wake_create(void)
+{
+#if defined(__APPLE__)
+   semaphore_t sem;
+   if (semaphore_create(mach_task_self(), &sem, SYNC_POLICY_FIFO, 0))
+      return RENDER_WAKE_NULL;
+   return sem;
+#else
+   const int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+   return fd < 0 ? RENDER_WAKE_NULL : fd;
+#endif
+}
 
-static const uint64_t pause_ns_table[] = { 0, 1000, 10000, 100000, 1000000 };
+static void
+wake_destroy(render_wake_t w)
+{
+   if (w == RENDER_WAKE_NULL)
+      return;
+#if defined(__APPLE__)
+   semaphore_destroy(mach_task_self(), w);
+#else
+   close(w);
+#endif
+}
+
+/* ------------------------------------------------------------------ */
+/* single-process conditional wake                                     */
+
+#define SP_ITEMS 20000
+#define SP_MAX_PAYLOAD 512
 
 static uint8_t
 payload_byte(uint32_t entry_idx, uint32_t j)
@@ -292,261 +315,555 @@ payload_byte(uint32_t entry_idx, uint32_t j)
    return (uint8_t)(entry_idx * 2654435761u + j * 40503u);
 }
 
-struct main_consumer {
-   const struct render_ring_buf *r;
-   uint32_t head;
+struct consumer_args {
+   struct test_region *region;
+   struct render_ring_buf ring;
+   render_wake_t wake;
+   uint32_t consumed_head;
+   uint32_t consumed;
+   atomic_bool stop;
+   int error;
 };
 
 static bool
 main_ring_has_work(void *opaque)
 {
-   const struct main_consumer *c = opaque;
-   return render_ring_has_entries(c->r, c->head);
+   const struct consumer_args *c = opaque;
+   return render_ring_has_entries(&c->ring, c->consumed_head);
 }
 
-struct compl_consumer {
+static void *
+consumer_thread(void *arg)
+{
+   struct consumer_args *c = arg;
+   struct rng sizes = { .s = 0x9e3779b97f4a7c15ull };
+
+   while (c->consumed < SP_ITEMS && !atomic_load(&c->stop)) {
+      uint32_t op, size;
+      const uint8_t *payload;
+      const enum render_ring_read_result res =
+         render_ring_read(&c->ring, &c->consumed_head, &op, &payload, &size);
+      if (res == RENDER_RING_READ_CORRUPT) {
+         fprintf(stderr, "FAIL: corrupt entry\n");
+         c->error = 1;
+         return NULL;
+      }
+      if (res == RENDER_RING_READ_OK) {
+         const uint32_t expect = rng_range(&sizes, SP_MAX_PAYLOAD + 1);
+         if (op != RENDER_RING_OP_SUBMIT_CMD || size != expect) {
+            fprintf(stderr, "FAIL: entry %u size %u expected %u\n",
+                    c->consumed, size, expect);
+            c->error = 1;
+            return NULL;
+         }
+         for (uint32_t j = 0; j < size; j++) {
+            if (payload[j] != payload_byte(c->consumed, j)) {
+               fprintf(stderr, "FAIL: entry %u byte %u corrupted\n",
+                       c->consumed, j);
+               c->error = 1;
+               return NULL;
+            }
+         }
+         c->consumed++;
+         render_ring_commit(&c->ring, c->consumed_head);
+         continue;
+      }
+
+      const enum render_ring_wait_result wr = render_ring_consumer_wait(
+         &c->region->ctl->main_state.value, c->wake, main_ring_has_work, c,
+         0 /* spin_ns */, -1 /* infinite */, NULL);
+      if (wr == RENDER_RING_WAIT_ERROR) {
+         c->error = 1;
+         return NULL;
+      }
+      /* WORK and WOKEN both fall back to draining */
+   }
+   return NULL;
+}
+
+/* consumer thread parks on the wake primitive while the producer pushes
+ * with pauses so it really sleeps; checks the full state machine */
+static void
+test_conditional_wake(void)
+{
+   struct test_region region;
+   test_region_init(&region, false);
+
+   struct consumer_args c = {
+      .region = &region,
+      .ring = test_main_buf(&region),
+      .wake = wake_create(),
+      .consumed_head = 0,
+      .consumed = 0,
+   };
+   atomic_init(&c.stop, false);
+   CHECK(c.wake != RENDER_WAKE_NULL, "wake_create failed");
+
+   pthread_t tid;
+   CHECK(pthread_create(&tid, NULL, consumer_thread, &c) == 0,
+         "pthread_create failed");
+
+   struct rng sizes = { .s = 0x9e3779b97f4a7c15ull };
+   struct rng pause_rng = { .s = 0xd1b54a32d192ed03ull };
+   uint8_t *buf = malloc(SP_MAX_PAYLOAD + 8);
+   const struct timespec pause = { .tv_sec = 0, .tv_nsec = 500000 };
+   const struct timespec backoff = { .tv_sec = 0, .tv_nsec = 20000 };
+
+   uint64_t entries = 0;
+   for (uint32_t i = 0; i < SP_ITEMS; i++) {
+      const uint32_t size = rng_range(&sizes, SP_MAX_PAYLOAD + 1);
+      for (uint32_t j = 0; j < size; j++)
+         buf[j] = payload_byte(i, j);
+      while (!render_ring_push(&c.ring, RENDER_RING_OP_SUBMIT_CMD, buf, size))
+         nanosleep(&backoff, NULL);
+      entries++;
+      render_ring_producer_wake(&region.ctl->main_state.value, c.wake, NULL);
+      /* pace the producer so the consumer genuinely parks */
+      if ((i % 64) == 63 || rng_range(&pause_rng, 4) == 0)
+         nanosleep(&pause, NULL);
+   }
+
+   pthread_join(tid, NULL);
+   CHECK(c.error == 0, "consumer reported an error");
+   CHECK(c.consumed == SP_ITEMS, "consumed %u != %u", c.consumed,
+         (unsigned)SP_ITEMS);
+   CHECK(entries == SP_ITEMS, "produced wrong count");
+
+   wake_destroy(c.wake);
+   free(buf);
+   test_region_fini(&region);
+}
+
+/* a signal posted before the wait must not be lost */
+static void
+test_signal_before_wait(void)
+{
+   render_wake_t w = wake_create();
+   CHECK(w != RENDER_WAKE_NULL, "wake_create failed");
+
+   render_wake_signal(w);
+   CHECK(render_wake_wait(w, 0) == true, "signalled wait returned timeout");
+
+   /* the primitive is counting: exactly one pending signal */
+   CHECK(render_wake_wait(w, 0) == false,
+         "phantom second signal observed");
+
+   /* two signals coalesce into at least one immediate return */
+   render_wake_signal(w);
+   render_wake_signal(w);
+   CHECK(render_wake_wait(w, 0) == true, "double signal lost");
+
+   wake_destroy(w);
+}
+
+/* ------------------------------------------------------------------ */
+/* cross-process conditional wake (posix_spawn + registered ports)      */
+
+#define XPROC_ITEMS 200000
+#define XPROC_MAX_PAYLOAD 2048
+
+#if defined(__APPLE__)
+/* spawn-time handoff: two semaphores in the child's registered ports */
+#define XPROC_PORT_MAIN 0
+#define XPROC_PORT_COMPL 1
+#define XPROC_PORT_COUNT 2
+#endif
+
+struct xproc_shared {
+   struct render_ring_control ctl;
+   /* the region is the control block plus the main ring laid out
+    * manually: control + 1 MiB ring */
+   uint8_t ring_data[RENDER_RING_MAIN_SIZE];
+};
+
+#define XPROC_REGION_SIZE ((uint32_t)sizeof(struct xproc_shared))
+
+static struct xproc_shared *
+xproc_region_create(int *fd_out)
+{
+
+   char name[64];
+   snprintf(name, sizeof(name), "/virgl-ring-test-%d", (int)getpid());
+   const int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+   if (fd < 0)
+      return NULL;
+   shm_unlink(name);
+   if (ftruncate(fd, XPROC_REGION_SIZE)) {
+      close(fd);
+      return NULL;
+   }
+   void *p = mmap(NULL, XPROC_REGION_SIZE, PROT_READ | PROT_WRITE,
+                  MAP_SHARED, fd, 0);
+   if (p == MAP_FAILED) {
+      close(fd);
+      return NULL;
+   }
+   memset(p, 0, XPROC_REGION_SIZE);
+   *fd_out = fd;
+   return p;
+}
+
+static struct render_ring_buf
+xproc_main_buf(struct xproc_shared *sh)
+{
+   return (struct render_ring_buf){
+      .head = &sh->ctl.main_head.value,
+      .tail = &sh->ctl.main_tail.value,
+      .data = sh->ring_data,
+      .size = RENDER_RING_MAIN_SIZE,
+   };
+}
+
+struct xproc_consumer {
+   struct render_ring_buf *ring;
+   uint32_t head;
+};
+
+static bool
+xproc_main_has_work(void *opaque)
+{
+   const struct xproc_consumer *c = opaque;
+   return render_ring_has_entries(c->ring, c->head);
+}
+
+struct xproc_compl {
    struct render_ring_control *ctl;
    uint32_t *last;
 };
 
 static bool
-compl_has_work(void *opaque)
+xproc_compl_has_work(void *opaque)
 {
-   const struct compl_consumer *c = opaque;
+   const struct xproc_compl *c = opaque;
    return atomic_load_explicit(&c->ctl->timelines[0], memory_order_acquire) !=
           *c->last;
 }
 
-static void
-stress_producer(struct test_region *region, int main_wake_w, int compl_w)
-{
-   struct render_ring_buf ring = test_main_buf(region);
-   struct rng sizes = { .s = 0x9e3779b97f4a7c15ull };
-   struct rng burst = { .s = 0xd1b54a32d192ed03ull };
-   uint8_t *buf = malloc(STRESS_MAX_PAYLOAD + 8);
-
-   const struct timespec ns20 = { .tv_sec = 0, .tv_nsec = 20000 };
-
-   uint32_t i = 0;
-   while (i < STRESS_ENTRIES) {
-      const uint32_t burst_len = 1 + rng_range(&burst, 64);
-      for (uint32_t b = 0; b < burst_len && i < STRESS_ENTRIES; b++, i++) {
-         const uint32_t size = rng_range(&sizes, STRESS_MAX_PAYLOAD + 1);
-         for (uint32_t j = 0; j < size; j++)
-            buf[j] = payload_byte(i, j);
-         while (!render_ring_push(&ring, RENDER_RING_OP_SUBMIT_CMD, buf, size))
-            nanosleep(&ns20, NULL);
-         atomic_fetch_add(&region->ctl->stats_vmm.v.main_entries, 1);
-         render_ring_producer_wake(&region->ctl->main_state.value, main_wake_w,
-                                   &region->ctl->stats_vmm.v.main_wakes);
-      }
-      const uint64_t pause = pause_ns_table[rng_range(&burst, 5)];
-      if (pause) {
-         const struct timespec ts = {
-            .tv_sec = (time_t)(pause / 1000000000ull),
-            .tv_nsec = (long)(pause % 1000000000ull),
-         };
-         nanosleep(&ts, NULL);
-      }
-   }
-
-   /* completion direction: publish seqno advances */
-   for (uint32_t s = 1; s <= STRESS_COMPLETIONS; s++) {
-      atomic_store_explicit(&region->ctl->timelines[0], s,
-                            memory_order_release);
-      render_ring_producer_wake(&region->ctl->vmm_state.value, compl_w,
-                                &region->ctl->stats_worker.v.fence_notifies);
-   }
-
-   free(buf);
-   _exit(0);
-}
-
+/* child: consume XPROC_ITEMS ordered entries off the main ring; for each
+ * consumed item publish a completion seqno (the reverse direction) */
 static int
-stress_consumer(struct test_region *region,
-                int main_wake_r,
-                int compl_r,
-                int death_r,
-                pid_t child)
+xproc_child(struct xproc_shared *sh, render_wake_t main_wake,
+            render_wake_t compl_wake)
 {
-   struct render_ring_buf ring = test_main_buf(region);
+   struct render_ring_buf ring = xproc_main_buf(sh);
    struct rng sizes = { .s = 0x9e3779b97f4a7c15ull };
-   struct main_consumer consumer = { .r = &ring, .head = 0 };
+   struct xproc_consumer consumer = { .ring = &ring, .head = 0 };
 
-   uint32_t consumed = 0;
-   bool child_reaped = false;
-   bool child_dead = false;
-
-   while (consumed < STRESS_ENTRIES || !child_dead) {
+   for (uint32_t i = 0; i < XPROC_ITEMS;) {
       uint32_t op, size;
       const uint8_t *payload;
       const enum render_ring_read_result res =
          render_ring_read(&ring, &consumer.head, &op, &payload, &size);
       if (res == RENDER_RING_READ_CORRUPT) {
-         fprintf(stderr, "FAIL: corrupt entry at %u\n", consumer.head);
-         return 1;
+         fprintf(stderr, "child: corrupt entry at %u\n", consumer.head);
+         return 2;
       }
       if (res == RENDER_RING_READ_OK) {
-         const uint32_t expect = rng_range(&sizes, STRESS_MAX_PAYLOAD + 1);
+         const uint32_t expect =
+            (uint32_t)sizeof(uint32_t) +
+            rng_range(&sizes, XPROC_MAX_PAYLOAD + 1 - (uint32_t)sizeof(uint32_t));
          if (op != RENDER_RING_OP_SUBMIT_CMD || size != expect) {
-            fprintf(stderr, "FAIL: entry %u op %u size %u expected %u\n",
-                    consumed, op, size, expect);
-            return 1;
+            fprintf(stderr, "child: entry %u size %u expected %u\n", i, size,
+                    expect);
+            return 2;
          }
-         for (uint32_t j = 0; j < size; j++) {
-            if (payload[j] != payload_byte(consumed, j)) {
-               fprintf(stderr, "FAIL: entry %u payload byte %u corrupted\n",
-                       consumed, j);
-               return 1;
+         uint32_t seq;
+         memcpy(&seq, payload, sizeof(seq));
+         if (seq != i) {
+            fprintf(stderr, "child: out-of-order seq %u expected %u\n", seq,
+                    i);
+            return 2;
+         }
+         for (uint32_t j = sizeof(seq); j < size; j++) {
+            if (payload[j] != payload_byte(i, j)) {
+               fprintf(stderr, "child: entry %u corrupted at byte %u\n", i,
+                       j);
+               return 2;
             }
          }
-         consumed++;
+         i++;
          render_ring_commit(&ring, consumer.head);
+
+         /* completion direction: publish seqno, conditional wake */
+         atomic_store_explicit(&sh->ctl.timelines[0], i,
+                               memory_order_release);
+         render_ring_producer_wake(&sh->ctl.vmm_state.value, compl_wake,
+                                   &sh->ctl.stats_worker.v.fence_notifies);
          continue;
       }
 
-      /* EMPTY: park with the real wake helper.  A bounded poll catches
-       * lost wakeups: if the ring has work while we timed out asleep,
-       * nobody signalled. */
       const enum render_ring_wait_result wr = render_ring_consumer_wait(
-         &region->ctl->main_state.value, main_wake_r, death_r,
-         main_ring_has_work, &consumer, 0 /* spin_ns */, 100 /* ms */,
-         &region->ctl->stats_worker.v.main_sleeps);
+         &sh->ctl.main_state.value, main_wake, xproc_main_has_work,
+         &consumer, 0, 3000ll * 1000000 /* 3 s */,
+         &sh->ctl.stats_worker.v.main_sleeps);
       if (wr == RENDER_RING_WAIT_ERROR)
-         return 1;
+         return 2;
       if (wr == RENDER_RING_WAIT_TIMEOUT) {
          if (render_ring_has_entries(&ring, consumer.head)) {
-            fprintf(stderr, "FAIL: lost wakeup at %u entries\n", consumed);
-            return 1;
+            fprintf(stderr, "child: lost wakeup at %u entries\n", i);
+            return 2;
          }
-         if (!child_reaped && waitpid(child, NULL, WNOHANG) == child) {
-            child_reaped = true;
-            child_dead = true;
-         }
-      }
-      if (wr == RENDER_RING_WAIT_FD1) {
-         char b;
-         if (read(death_r, &b, 1) <= 0)
-            child_dead = true;
+         fprintf(stderr, "child: timed out waiting for entry %u\n", i);
+         return 2;
       }
    }
-
-   /* completion direction: the child published seqno advances; consume
-    * them with the sync-thread wake logic */
-   uint32_t last = 0;
-   struct compl_consumer compl_ctx = { .ctl = region->ctl, .last = &last };
-
-   while (last < STRESS_COMPLETIONS) {
-      last = atomic_load_explicit(&region->ctl->timelines[0],
-                                  memory_order_acquire);
-      if (last >= STRESS_COMPLETIONS)
-         break;
-      const enum render_ring_wait_result wr = render_ring_consumer_wait(
-         &region->ctl->vmm_state.value, compl_r, -1, compl_has_work,
-         &compl_ctx, 0 /* spin_ns */, 100 /* ms */,
-         &region->ctl->stats_vmm.v.vmm_sleeps);
-      if (wr == RENDER_RING_WAIT_ERROR)
-         return 1;
-      if (wr == RENDER_RING_WAIT_TIMEOUT &&
-          atomic_load_explicit(&region->ctl->timelines[0],
-                               memory_order_acquire) != last) {
-         fprintf(stderr, "FAIL: lost completion wakeup at %u\n", last);
-         return 1;
-      }
-   }
-
-   if (last != STRESS_COMPLETIONS) {
-      fprintf(stderr, "FAIL: completion count %u != %u\n", last,
-              STRESS_COMPLETIONS);
-      return 1;
-   }
-
    return 0;
 }
 
+#if defined(__APPLE__)
 static int
-test_two_process(void)
+xproc_child_main(int shmem_fd)
 {
-   struct test_region region;
-   test_region_init(&region, false);
+   mach_port_array_t ports = NULL;
+   mach_msg_type_number_t count = 0;
+   if (mach_ports_lookup(mach_task_self(), &ports, &count) != KERN_SUCCESS ||
+       count < XPROC_PORT_COUNT || !ports[XPROC_PORT_MAIN] ||
+       !ports[XPROC_PORT_COMPL]) {
+      fprintf(stderr, "child: missing registered ports (count %u)\n",
+              (unsigned)count);
+      return 2;
+   }
+   /* ports array stays mapped for the child's lifetime */
 
-   int main_wake[2], compl[2], death[2];
-   if (make_pipe(main_wake) || make_pipe(compl) || make_pipe(death))
-      return 1;
 
-   const pid_t child = fork();
-   if (child < 0)
-      return 1;
-   if (child == 0) {
-      close(main_wake[0]);
-      close(compl[0]);
-      close(death[0]);
-      stress_producer(&region, main_wake[1], compl[1]);
+   struct stat st;
+   if (fstat(shmem_fd, &st) || st.st_size < (off_t)XPROC_REGION_SIZE) {
+      fprintf(stderr, "child: bad shmem fd\n");
+      return 2;
+   }
+   void *p = mmap(NULL, XPROC_REGION_SIZE, PROT_READ | PROT_WRITE,
+                  MAP_SHARED, shmem_fd, 0);
+   if (p == MAP_FAILED) {
+      fprintf(stderr, "child: mmap failed\n");
+      return 2;
+   }
+   return xproc_child((struct xproc_shared *)p, ports[XPROC_PORT_MAIN],
+                      ports[XPROC_PORT_COMPL]);
+}
+#endif /* __APPLE__ */
+
+static int
+xproc_parent(struct xproc_shared *sh, render_wake_t main_wake,
+             render_wake_t compl_wake, pid_t child)
+{
+   struct render_ring_buf ring = xproc_main_buf(sh);
+   struct rng sizes = { .s = 0x9e3779b97f4a7c15ull };
+   struct rng burst = { .s = 0xd1b54a32d192ed03ull };
+   uint8_t *buf = malloc(XPROC_MAX_PAYLOAD + 8);
+
+   const struct timespec backoff = { .tv_sec = 0, .tv_nsec = 20000 };
+
+   uint32_t produced = 0;
+   uint32_t last_compl = 0;
+   struct xproc_compl compl_ctx = { .ctl = &sh->ctl, .last = &last_compl };
+
+   while (produced < XPROC_ITEMS) {
+      const uint32_t burst_len = 1 + rng_range(&burst, 64);
+      for (uint32_t b = 0; b < burst_len && produced < XPROC_ITEMS;
+           b++, produced++) {
+         const uint32_t size =
+            (uint32_t)sizeof(uint32_t) +
+            rng_range(&sizes, XPROC_MAX_PAYLOAD + 1 - (uint32_t)sizeof(uint32_t));
+         memcpy(buf, &produced, sizeof(produced));
+         for (uint32_t j = sizeof(uint32_t); j < size; j++)
+            buf[j] = payload_byte(produced, j);
+         while (!render_ring_push(&ring, RENDER_RING_OP_SUBMIT_CMD, buf,
+                                  size))
+            nanosleep(&backoff, NULL);
+         render_ring_producer_wake(&sh->ctl.main_state.value, main_wake,
+                                   &sh->ctl.stats_vmm.v.main_wakes);
+      }
+      /* pace between bursts so the consumer parks: bursty production
+       * should yield far fewer wakes than items, but not zero */
+      const uint64_t pause_ns = (uint64_t)rng_range(&burst, 4) * 50000;
+      if (pause_ns) {
+         const struct timespec pause = {
+            .tv_sec = 0,
+            .tv_nsec = (long)pause_ns,
+         };
+         nanosleep(&pause, NULL);
+      }
+      /* opportunistically harvest completions while producing */
+      last_compl = atomic_load_explicit(&sh->ctl.timelines[0],
+                                        memory_order_acquire);
    }
 
-   close(main_wake[1]);
-   close(compl[1]);
-   close(death[1]);
-
-   const int ret = stress_consumer(&region, main_wake[0], compl[0], death[0],
-                                   child);
+   /* drain completions with the VMM-side conditional wake */
+   while (last_compl < XPROC_ITEMS) {
+      const enum render_ring_wait_result wr = render_ring_consumer_wait(
+         &sh->ctl.vmm_state.value, compl_wake, xproc_compl_has_work,
+         &compl_ctx, 0, 3000ll * 1000000,
+         &sh->ctl.stats_vmm.v.vmm_sleeps);
+      if (wr == RENDER_RING_WAIT_ERROR)
+         goto fail;
+      if (wr == RENDER_RING_WAIT_TIMEOUT) {
+         const uint32_t now = atomic_load_explicit(&sh->ctl.timelines[0],
+                                                   memory_order_acquire);
+         if (now != last_compl) {
+            last_compl = now;
+            continue;
+         }
+         fprintf(stderr, "parent: lost completion wakeup at %u\n",
+                 last_compl);
+         goto fail;
+      }
+      last_compl = atomic_load_explicit(&sh->ctl.timelines[0],
+                                        memory_order_acquire);
+   }
 
    int status = 0;
    waitpid(child, &status, 0);
-   close(main_wake[0]);
-   close(compl[0]);
-   close(death[0]);
-   test_region_fini(&region);
+   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      fprintf(stderr, "parent: child failed (status %d)\n", status);
+      goto fail;
+   }
 
-   CHECK(ret == 0, "stress consumer failed");
-   CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
-         "producer child failed (status %d)", status);
+   /* bursty production: wakes must be far below the item count */
+   const uint64_t wakes =
+      atomic_load(&sh->ctl.stats_vmm.v.main_wakes);
+   const uint64_t compl_wakes =
+      atomic_load(&sh->ctl.stats_worker.v.fence_notifies);
+   printf("cross-process: %u items, %llu main wakes, %llu completion "
+          "wakes\n",
+          (unsigned)XPROC_ITEMS, (unsigned long long)wakes,
+          (unsigned long long)compl_wakes);
+   CHECK(wakes > 0, "no conditional wakes observed");
+   CHECK(wakes < XPROC_ITEMS, "wakes %llu not below item count %u",
+         (unsigned long long)wakes, (unsigned)XPROC_ITEMS);
+   CHECK(compl_wakes < XPROC_ITEMS,
+         "completion wakes %llu not below item count",
+         (unsigned long long)compl_wakes);
+
+   free(buf);
+   return 0;
+
+fail:
+   free(buf);
+   kill(child, SIGKILL);
+   waitpid(child, NULL, 0);
+   return 1;
+}
+
+static int
+test_cross_process(void)
+{
+#if defined(__APPLE__)
+   int shm_fd = -1;
+   struct xproc_shared *sh = xproc_region_create(&shm_fd);
+   CHECK(sh != NULL, "region create failed");
+   if (!sh)
+      return 1;
+
+   render_wake_t main_wake = wake_create();
+   render_wake_t compl_wake = wake_create();
+   CHECK(main_wake != RENDER_WAKE_NULL && compl_wake != RENDER_WAKE_NULL,
+         "wake_create failed");
+
+   /* child executable: self, or an x86_64 build for the Rosetta run */
+   char self[4096];
+   uint32_t self_len = sizeof(self);
+   const char *child_path = getenv("TEST_RENDER_RING_CHILD");
+   if (!child_path) {
+      if (_NSGetExecutablePath(self, &self_len))
+         goto fail;
+      child_path = self;
+   }
+
+   char fd_str[16];
+   snprintf(fd_str, sizeof(fd_str), "%d", shm_fd);
+   char *const argv[] = {
+      (char *)child_path, (char *)"--ring-child", fd_str, NULL,
+   };
+
+   posix_spawnattr_t attr;
+   if (posix_spawnattr_init(&attr))
+      goto fail;
+   posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+   const mach_port_t ports[XPROC_PORT_COUNT] = { main_wake, compl_wake };
+   if (posix_spawnattr_set_registered_ports_np(&attr, ports,
+                                               XPROC_PORT_COUNT)) {
+      fprintf(stderr, "registered ports failed\n");
+      posix_spawnattr_destroy(&attr);
+      goto fail;
+   }
+
+   posix_spawn_file_actions_t fa;
+   if (posix_spawn_file_actions_init(&fa)) {
+      posix_spawnattr_destroy(&attr);
+      goto fail;
+   }
+   posix_spawn_file_actions_addinherit_np(&fa, STDIN_FILENO);
+   posix_spawn_file_actions_addinherit_np(&fa, STDOUT_FILENO);
+   posix_spawn_file_actions_addinherit_np(&fa, STDERR_FILENO);
+   posix_spawn_file_actions_addinherit_np(&fa, shm_fd);
+
+   pid_t child;
+   const int err = posix_spawn(&child, child_path, &fa, &attr, argv, NULL);
+   posix_spawn_file_actions_destroy(&fa);
+   posix_spawnattr_destroy(&attr);
+   if (err) {
+      fprintf(stderr, "posix_spawn(%s): %s\n", child_path, strerror(err));
+      goto fail;
+   }
+
+   const int ret = xproc_parent(sh, main_wake, compl_wake, child);
+   wake_destroy(main_wake);
+   wake_destroy(compl_wake);
+   close(shm_fd);
+   munmap(sh, XPROC_REGION_SIZE);
    return ret;
+
+fail:
+   wake_destroy(main_wake);
+   wake_destroy(compl_wake);
+   if (shm_fd >= 0)
+      close(shm_fd);
+   munmap(sh, XPROC_REGION_SIZE);
+   failures++;
+   return 1;
+#else
+   /* Linux: fork + eventfd; the shared mapping survives exec-free
+    * spawn through MAP_ANON */
+   struct xproc_shared *sh =
+      mmap(NULL, XPROC_REGION_SIZE, PROT_READ | PROT_WRITE,
+           MAP_SHARED | MAP_ANON, -1, 0);
+   CHECK(sh != MAP_FAILED, "region create failed");
+   if (sh == MAP_FAILED)
+      return 1;
+   memset(sh, 0, XPROC_REGION_SIZE);
+
+   render_wake_t main_wake = wake_create();
+   render_wake_t compl_wake = wake_create();
+   CHECK(main_wake != RENDER_WAKE_NULL && compl_wake != RENDER_WAKE_NULL,
+         "wake_create failed");
+
+   const pid_t child = fork();
+   if (child < 0) {
+      failures++;
+      return 1;
+   }
+   if (child == 0)
+      _exit(xproc_child(sh, main_wake, compl_wake));
+
+   const int ret = xproc_parent(sh, main_wake, compl_wake, child);
+   wake_destroy(main_wake);
+   wake_destroy(compl_wake);
+   munmap(sh, XPROC_REGION_SIZE);
+   return ret;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
-/* death test                                                          */
+/* producer bail-out when the worker is dead                            */
 
 static int
-test_death(void)
+test_dead_worker_bailout(void)
 {
    struct test_region region;
    test_region_init(&region, false);
 
-   int main_wake[2], death[2];
-   if (make_pipe(main_wake) || make_pipe(death))
-      return 1;
-
-   const pid_t child = fork();
-   if (child < 0)
-      return 1;
-   if (child == 0) {
-      close(death[0]);
-      close(main_wake[0]);
-      /* produce a few entries, then die mid-stream holding the death
-       * pipe's write end */
-      struct render_ring_buf ring = test_main_buf(&region);
-      const uint8_t p[8] = { 0 };
-      for (int i = 0; i < 16; i++)
-         render_ring_push(&ring, RENDER_RING_OP_SUBMIT_CMD, p, sizeof(p));
-      _exit(0);
-   }
-
-   close(death[1]);
-   close(main_wake[1]);
-
-   /* the death pipe must report EOF promptly */
-   struct pollfd pf = { .fd = death[0], .events = POLLIN };
-   const int pr = poll(&pf, 1, 2000);
-   CHECK(pr == 1, "death pipe did not fire (poll=%d revents=%x)", pr,
-         pf.revents);
-   char b;
-   const ssize_t rd = read(death[0], &b, 1);
-   CHECK(rd <= 0, "death pipe not at EOF (read=%zd)", rd);
-
-   /* producer-side contract: once the worker is dead, pushes must bail
-    * with an error instead of hanging.  Mirror the production
-    * worker_dead check on a now-full ring. */
+   /* producer-side contract: once worker_dead is set, pushes must bail
+    * with an error instead of hanging on a ring that will never drain */
    _Atomic bool worker_dead = true;
    struct render_ring_buf ring = test_main_buf(&region);
    uint8_t *scratch = calloc(1, 65536);
@@ -554,9 +871,6 @@ test_death(void)
    }
    while (render_ring_push(&ring, RENDER_RING_OP_SUBMIT_CMD, scratch, 8)) {
    }
-   /* the ring is now so full that not even a header fits contiguously;
-    * the next push can only succeed after a wrap+pad, which needs space
-    * the dead consumer will never free */
    while (render_ring_push(&ring, RENDER_RING_OP_SUBMIT_CMD, scratch,
                            RENDER_RING_MAX_INLINE_CMD - 8)) {
    }
@@ -574,11 +888,6 @@ test_death(void)
    }
    CHECK(!pushed, "producer kept pushing on a full ring with a dead worker");
    free(scratch);
-
-   int status;
-   waitpid(child, &status, 0);
-   close(death[0]);
-   close(main_wake[0]);
    test_region_fini(&region);
    return 0;
 }
@@ -681,13 +990,22 @@ test_lat_layout(void)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+#if defined(__APPLE__)
+   if (argc >= 3 && !strcmp(argv[1], "--ring-child"))
+      return xproc_child_main(atoi(argv[2]));
+#endif
+   (void)argc;
+   (void)argv;
+
    test_encode_decode();
    test_lat_layout();
-   if (test_two_process())
+   test_signal_before_wait();
+   test_conditional_wake();
+   if (test_dead_worker_bailout())
       failures++;
-   if (test_death())
+   if (test_cross_process())
       failures++;
 
    if (failures) {

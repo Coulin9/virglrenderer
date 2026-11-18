@@ -26,6 +26,62 @@
 #include "proxy_client.h"
 #include "neptune/npt_work_context.h"
 
+/* Wake primitives and the worker-exit path differ per platform: macOS
+ * spawns the worker directly and passes Mach semaphores as registered
+ * ports; other platforms hand pipe/eventfd pairs over INIT. */
+static inline render_wake_t
+proxy_context_main_wake(const struct proxy_context *ctx)
+{
+#if defined(__APPLE__)
+   return ctx->worker.main_wake;
+#else
+   return ctx->main_wake_write;
+#endif
+}
+
+static inline render_wake_t
+proxy_context_oob_wake(const struct proxy_context *ctx)
+{
+#if defined(__APPLE__)
+   return ctx->worker.oob_wake;
+#else
+   return ctx->oob_wake_write;
+#endif
+}
+
+/* Nudge the sync thread out of its wait so it can run a pass. */
+static inline void
+proxy_context_nudge_sync(struct proxy_context *ctx)
+{
+#if defined(__APPLE__)
+   render_wake_signal(ctx->worker.completion_wake);
+#else
+   write_eventfd(ctx->sync_thread.fence_eventfd_write, 1);
+#endif
+}
+
+#if defined(__APPLE__)
+/* Monitor thread callback: the monitor already reaped and logged the
+ * child.  Death ordering: mark the guest-visible status page lost
+ * first, then seq_cst-store worker_dead (pairs with the submit_fence
+ * post-publish seq_cst load), then wake the sync thread for the
+ * force-retire pass. */
+static void
+proxy_context_on_worker_exit(struct proxy_worker *worker, void *udata)
+{
+   struct proxy_context *ctx = udata;
+
+   (void)worker;
+   struct npt_context_status_page *page =
+      atomic_load_explicit(&ctx->status_page, memory_order_seq_cst);
+   if (page)
+      proxy_status_page_mark_lost(page, NPT_CONTEXT_STATUS_LOST_WORKER_EXIT,
+                                  render_ring_now_ns());
+   atomic_store_explicit(&ctx->worker_dead, true, memory_order_seq_cst);
+   render_wake_signal(ctx->worker.completion_wake);
+}
+#endif
+
 struct proxy_fence {
    uint32_t flags;
    uint32_t seqno;
@@ -124,8 +180,8 @@ proxy_context_retire_timeline_fences_locked(struct proxy_context *ctx,
                                             uint32_t cur_seqno)
 {
    struct proxy_timeline *timeline = &ctx->timelines[ring_idx];
-   /* once the death pipe fired, retire every fence whose fd will never
-    * signal instead of leaving a hung engine to the guest */
+   /* once worker exit was observed, retire every fence whose fd will
+    * never signal instead of leaving a hung engine to the guest */
    const bool force_retire_all =
       atomic_load_explicit(&ctx->worker_dead, memory_order_acquire);
 
@@ -175,8 +231,10 @@ proxy_context_retire_timeline_fences_locked(struct proxy_context *ctx,
 static void
 proxy_context_retire_fences_internal(struct proxy_context *ctx)
 {
+#if !defined(__APPLE__)
    if (ctx->sync_thread.fence_eventfd >= 0)
       flush_eventfd(ctx->sync_thread.fence_eventfd);
+#endif
 
    if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
       mtx_lock(&ctx->timeline_mutex);
@@ -226,11 +284,37 @@ proxy_context_sync_thread(void *arg)
       if (ctx->sync_thread.stop)
          break;
 
+#if defined(__APPLE__)
+      /* Wait only on the completion semaphore: the process-wide
+       * EVFILT_PROC monitor sets worker_dead and signals us, so a dead
+       * worker can no longer strand this thread and its pending fences. */
+      const enum render_ring_wait_result res = render_ring_consumer_wait(
+         &ctx->ring->vmm_state.value, ctx->worker.completion_wake,
+         proxy_context_sync_has_work, ctx, 0 /* spin_ns */, -1 /* timeout */,
+         vmm_sleeps);
+      if (ctx->lat)
+         ctx->lat_vmm_wake_ts = render_ring_now_ns();
+
+      if (res == RENDER_RING_WAIT_ERROR) {
+         proxy_log("failed to wait on completion semaphore");
+         break;
+      }
+
+      /* the monitor callback already marked the status page lost and
+       * stored worker_dead; only the force-retire pass is left */
+      if (!ctx->worker_death_handled &&
+          atomic_load_explicit(&ctx->worker_dead, memory_order_acquire)) {
+         ctx->worker_death_handled = true;
+         proxy_log("ctx %d worker died; retiring all fences",
+                   ctx->base.ctx_id);
+         proxy_context_retire_fences_internal(ctx);
+      }
+#else
       /* Poll the completion wake fd and the death pipe with no timeout:
        * the worker closes the pipe on exit, so a dead worker can no
        * longer strand this thread and its pending fences. */
       const int death_fd = ctx->death_read_fd;
-      const enum render_ring_wait_result res = render_ring_consumer_wait(
+      const enum render_ring_wait_result res = render_ring_consumer_wait_fd(
          &ctx->ring->vmm_state.value, ctx->sync_thread.fence_eventfd, death_fd,
          proxy_context_sync_has_work, ctx, 0 /* spin_ns */, -1 /* timeout */,
          vmm_sleeps);
@@ -263,6 +347,7 @@ proxy_context_sync_thread(void *arg)
             proxy_context_retire_fences_internal(ctx);
          }
       }
+#endif
    }
 
    return 0;
@@ -331,7 +416,7 @@ proxy_context_ring_push(struct proxy_context *ctx,
          const uint64_t entries =
             atomic_fetch_add(&ctx->ring->stats_vmm.v.main_entries, 1) + 1;
          render_ring_producer_wake(&ctx->ring->main_state.value,
-                                   ctx->main_wake_write,
+                                   proxy_context_main_wake(ctx),
                                    &ctx->ring->stats_vmm.v.main_wakes);
          proxy_context_ring_stats_maybe_log(ctx, entries);
          return true;
@@ -356,7 +441,7 @@ proxy_context_ring_push_oob(struct proxy_context *ctx,
       if (render_ring_oob_push(&ctx->oob_ring, fence)) {
          atomic_fetch_add(&ctx->ring->stats_vmm.v.oob_entries, 1);
          render_ring_producer_wake(&ctx->ring->oob_state.value,
-                                   ctx->oob_wake_write,
+                                   proxy_context_oob_wake(ctx),
                                    &ctx->ring->stats_vmm.v.oob_wakes);
          return true;
       }
@@ -472,7 +557,7 @@ proxy_context_submit_fence(struct virgl_context *base,
     * is dead, keep the fence registered and nudge the sync thread into
     * another retire pass -- the fence gets force-retired like the rest. */
    if (atomic_load_explicit(&ctx->worker_dead, memory_order_seq_cst)) {
-      write_eventfd(ctx->sync_thread.fence_eventfd_write, 1);
+      proxy_context_nudge_sync(ctx);
       return 0;
    }
 
@@ -509,7 +594,15 @@ proxy_context_get_fencing_fd(struct virgl_context *base)
    struct proxy_context *ctx = (struct proxy_context *)base;
 
    assert(!(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB));
+#if defined(__APPLE__)
+   /* no fd-based completion channel on macOS: ASYNC_FENCE_CB is
+    * required there (libkrun always sets it) */
+   proxy_log("ctx %d: fencing fd unavailable without ASYNC_FENCE_CB",
+             ctx->base.ctx_id);
+   return -1;
+#else
    return ctx->sync_thread.fence_eventfd;
+#endif
 }
 
 static int
@@ -938,6 +1031,13 @@ proxy_context_destroy(struct virgl_context *base)
    struct proxy_context *ctx = (struct proxy_context *)base;
    npt_work_context_client_destroy(ctx->work_context);
 
+#if defined(__APPLE__)
+   if (ctx->sync_thread.created) {
+      ctx->sync_thread.stop = true;
+      proxy_context_nudge_sync(ctx);
+      thrd_join(ctx->sync_thread.thread, NULL);
+   }
+#else
    if (ctx->sync_thread.fence_eventfd >= 0) {
       if (ctx->sync_thread.created) {
          ctx->sync_thread.stop = true;
@@ -949,6 +1049,7 @@ proxy_context_destroy(struct virgl_context *base)
          close(ctx->sync_thread.fence_eventfd_write);
       close(ctx->sync_thread.fence_eventfd);
    }
+#endif
 
    if (ctx->ring_stats_enabled && ctx->ring)
       proxy_context_ring_stats_log(ctx);
@@ -956,6 +1057,7 @@ proxy_context_destroy(struct virgl_context *base)
    if (ctx->lat)
       proxy_context_lat_dump(ctx);
 
+#if !defined(__APPLE__)
    if (ctx->main_wake_write >= 0)
       close(ctx->main_wake_write);
    if (ctx->oob_wake_write >= 0)
@@ -971,9 +1073,11 @@ proxy_context_destroy(struct virgl_context *base)
       close(ctx->ring_fds.death_write);
    if (ctx->ring_fds.oob_wake_read >= 0)
       close(ctx->ring_fds.oob_wake_read);
+#endif
    proxy_socket_fini(&ctx->socket);
 
-   /* ask the server process to terminate the context process */
+   /* terminate the context worker (on macOS: unwatch, reap, and release
+    * its wake semaphores; elsewhere: ask the server process) */
    if (!proxy_client_destroy_context(ctx->client, ctx->base.ctx_id))
       proxy_log("failed to destroy ctx %d", ctx->base.ctx_id);
 
@@ -1026,6 +1130,7 @@ proxy_context_init_base(struct proxy_context *ctx)
    ctx->base.submit_fence = proxy_context_submit_fence;
 }
 
+#if !defined(__APPLE__)
 /* On eventfd platforms create_fence_pipe hands back one fd for both ends,
  * so the fd sent to the worker must be a dup: closing our own copy after
  * INIT would kill our end of the channel too.  When the ends differ the
@@ -1035,10 +1140,12 @@ proxy_context_worker_fd(int fd, int other_end)
 {
    return fd == other_end ? dup(fd) : fd;
 }
+#endif
 
 static bool
 proxy_context_init_fencing(struct proxy_context *ctx)
 {
+#if !defined(__APPLE__)
    /* The render worker updates the shmem timelines and conditionally
     * signals the completion wake fd (always when the client lacks
     * VIRGL_RENDERER_ASYNC_FENCE_CB).  The main/oob wake pipes let the
@@ -1096,6 +1203,10 @@ proxy_context_init_fencing(struct proxy_context *ctx)
       ctx->ring_fds.oob_wake_read =
          proxy_context_worker_fd(oob_wake_read, ctx->oob_wake_write);
    }
+#endif
+   /* On macOS the three wake semaphores were created and registered as
+    * the worker's ports in proxy_worker_spawn, and the EVFILT_PROC
+    * monitor replaces the death pipe. */
 
    if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB) {
       int ret = thrd_create(&ctx->sync_thread.thread, proxy_context_sync_thread, ctx);
@@ -1212,6 +1323,11 @@ proxy_context_init(struct proxy_context *ctx, uint32_t ctx_flags)
       .lat_ring_size = layout.lat_size,
       .work_context = ctx->work_context_config,
    };
+#if defined(__APPLE__)
+   /* INIT carries only the ring shmem: the wake semaphores were handed
+    * over at spawn as registered ports and there is no death pipe. */
+   const int req_fds[] = { ctx->shmem.fd };
+#else
    const int req_fds[5] = {
       ctx->shmem.fd,
       ctx->ring_fds.completion_write,
@@ -1219,13 +1335,19 @@ proxy_context_init(struct proxy_context *ctx, uint32_t ctx_flags)
       ctx->ring_fds.death_write,
       ctx->ring_fds.oob_wake_read,
    };
+#endif
+#if defined(__APPLE__)
+   const int req_fd_count = 1;
+#else
    const int req_fd_count = ctx->has_oob_ring ? 5 : 4;
+#endif
    if (!proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req), req_fds,
                                            req_fd_count)) {
       proxy_log("failed to initialize context");
       return false;
    }
 
+#if !defined(__APPLE__)
    /* the worker holds its own copies now; drop the ones we must not keep
     * (the death pipe reports EOF exactly when the worker exits; a dup
     * close leaves our own end intact on eventfd platforms) */
@@ -1240,6 +1362,7 @@ proxy_context_init(struct proxy_context *ctx, uint32_t ctx_flags)
       close(ctx->ring_fds.oob_wake_read);
       ctx->ring_fds.oob_wake_read = -1;
    }
+#endif
 
    return true;
 }
@@ -1255,17 +1378,28 @@ proxy_context_create(uint32_t ctx_id,
 
    const uint32_t capset_id = ctx_flags & VIRGL_RENDERER_CONTEXT_FLAG_CAPSET_ID_MASK;
 
+   ctx = calloc(1, sizeof(*ctx));
+   if (!ctx)
+      return NULL;
+
+#if defined(__APPLE__)
+   /* the monitor must be able to flag the context before spawn returns */
+   ctx->worker.on_exit = proxy_context_on_worker_exit;
+   ctx->worker.udata = ctx;
+#endif
+
    int ctx_fd;
    uint32_t worker_pid;
    if (!proxy_client_create_context(client, ctx_id, capset_id, debug_len, debug_name,
-                                    &ctx_fd, &worker_pid)) {
+                                    &ctx_fd, &worker_pid,
+#if defined(__APPLE__)
+                                    &ctx->worker
+#else
+                                    NULL
+#endif
+                                    )) {
       proxy_log("failed to create a context");
-      return NULL;
-   }
-
-   ctx = calloc(1, sizeof(*ctx));
-   if (!ctx) {
-      close(ctx_fd);
+      free(ctx);
       return NULL;
    }
 
@@ -1279,9 +1413,10 @@ proxy_context_create(uint32_t ctx_id,
    mtx_init(&ctx->ring_mutex, mtx_plain);
    mtx_init(&ctx->free_fences_mutex, mtx_plain);
    list_inithead(&ctx->free_fences);
+   ctx->has_oob_ring = capset_id == VIRTGPU_DRM_CAPSET_NEPTUNE;
+#if !defined(__APPLE__)
    ctx->sync_thread.fence_eventfd = -1;
    ctx->sync_thread.fence_eventfd_write = -1;
-   ctx->has_oob_ring = capset_id == VIRTGPU_DRM_CAPSET_NEPTUNE;
    ctx->main_wake_write = -1;
    ctx->oob_wake_write = -1;
    ctx->death_read_fd = -1;
@@ -1289,6 +1424,7 @@ proxy_context_create(uint32_t ctx_id,
    ctx->ring_fds.main_wake_read = -1;
    ctx->ring_fds.death_write = -1;
    ctx->ring_fds.oob_wake_read = -1;
+#endif
    ctx->ring_stats_enabled = getenv("VIRGL_PROXY_RING_STATS") != NULL;
    ctx->lat_trace_dir = getenv("VIRGL_LATENCY_TRACE");
    ctx->lat_trace_enabled =

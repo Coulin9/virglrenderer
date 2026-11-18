@@ -19,18 +19,20 @@
  *
  *   consumer: drain; optional bounded spin; store SLEEPING (relaxed);
  *   seq_cst fence; re-check for work -> if any, store ACTIVE and keep
- *   draining; else poll the wake fd; drain the fd non-blockingly; store
- *   ACTIVE.
+ *   draining; else wait on the wake primitive; store ACTIVE.
  *
  *   producer: publish (release store of tail / timeline seqno); seq_cst
  *   fence; if load(state)==SLEEPING && CAS(SLEEPING->WAKING), signal the
- *   wake fd once.  Wake fds are counting-tolerant: a stale byte only costs
- *   one early return.
+ *   wake once.  Wake primitives are counting-tolerant: a stale signal
+ *   only costs one early return.
+ *
+ * On macOS the wake primitive is a Mach semaphore handed to the worker
+ * at spawn time through the task registered ports; on Linux it is a
+ * nonblocking eventfd passed over the context socket at INIT.
  */
 
 #include <assert.h>
 #include <errno.h>
-#include <poll.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -38,6 +40,29 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#else
+#include <poll.h>
+#endif
+
+/* Wake primitive shared by the proxy (VMM) and the worker. */
+#if defined(__APPLE__)
+typedef semaphore_t render_wake_t;
+#define RENDER_WAKE_NULL MACH_PORT_NULL
+
+/* Index of each wake semaphore in the worker's task registered ports,
+ * fixed at spawn time (posix_spawnattr_set_registered_ports_np /
+ * mach_ports_lookup). */
+#define RENDER_WAKE_PORT_MAIN 0
+#define RENDER_WAKE_PORT_OOB 1
+#define RENDER_WAKE_PORT_COMPLETION 2
+#define RENDER_WAKE_PORT_COUNT 3
+#else
+typedef int render_wake_t; /* eventfd, EFD_NONBLOCK */
+#define RENDER_WAKE_NULL (-1)
+#endif
 
 #define RENDER_RING_CACHELINE 128
 /* matches virtio-gpu / PROXY_CONTEXT_TIMELINE_COUNT */
@@ -555,28 +580,74 @@ render_ring_oob_commit(const struct render_ring_oob *r, uint32_t head)
 /* conditional wake state machine                                      */
 
 static inline void
+render_wake_signal(render_wake_t w)
+{
+#if defined(__APPLE__)
+   semaphore_signal(w);
+#else
+   const uint64_t one = 1;
+   ssize_t ret;
+   do {
+      ret = write(w, &one, sizeof(one));
+   } while (ret < 0 && errno == EINTR);
+   (void)ret; /* EAGAIN on a full eventfd is harmless: it stays signalled */
+#endif
+}
+
+/* timeout_ns < 0: infinite.  Returns true when signalled, false on
+ * timeout or error. */
+static inline bool
+render_wake_wait(render_wake_t w, int64_t timeout_ns)
+{
+#if defined(__APPLE__)
+   kern_return_t kr;
+   if (timeout_ns < 0) {
+      do {
+         kr = semaphore_wait(w);
+      } while (kr == KERN_ABORTED);
+   } else {
+      const mach_timespec_t ts = {
+         .tv_sec = (unsigned int)(timeout_ns / 1000000000ll),
+         .tv_nsec = (clock_res_t)(timeout_ns % 1000000000ll),
+      };
+      do {
+         kr = semaphore_timedwait(w, ts);
+      } while (kr == KERN_ABORTED);
+   }
+   return kr == KERN_SUCCESS;
+#else
+   struct pollfd pfd = { .fd = w, .events = POLLIN };
+   const int timeout_ms = timeout_ns < 0 ? -1
+                                         : (int)((timeout_ns + 999999) / 1000000);
+   int ret;
+   do {
+      ret = poll(&pfd, 1, timeout_ms);
+   } while (ret < 0 && errno == EINTR);
+   if (ret <= 0)
+      return false;
+   uint64_t v;
+   ssize_t rd;
+   do {
+      rd = read(w, &v, sizeof(v));
+   } while (rd < 0 && errno == EINTR);
+   return true;
+#endif
+}
+
+#ifndef __APPLE__
+static inline void
 render_ring_fd_drain(int fd)
 {
    uint8_t buf[64];
    while (read(fd, buf, sizeof(buf)) > 0) {
    }
 }
-
-static inline void
-render_ring_fd_signal(int fd)
-{
-   const uint64_t one = 1;
-   ssize_t ret;
-   do {
-      ret = write(fd, &one, sizeof(one));
-   } while (ret < 0 && errno == EINTR);
-   (void)ret; /* EAGAIN on a full pipe is harmless: it stays readable */
-}
+#endif
 
 /* Producer side: call after the release store that publishes work. */
 static inline void
 render_ring_producer_wake(atomic_uint *state,
-                          int wake_write_fd,
+                          render_wake_t wake,
                           _Atomic uint64_t *wake_stat)
 {
    atomic_thread_fence(memory_order_seq_cst);
@@ -585,7 +656,7 @@ render_ring_producer_wake(atomic_uint *state,
        atomic_compare_exchange_strong_explicit(state, &expected, RENDER_RING_WAKING,
                                                memory_order_acq_rel,
                                                memory_order_relaxed)) {
-      render_ring_fd_signal(wake_write_fd);
+      render_wake_signal(wake);
       if (wake_stat)
          atomic_fetch_add_explicit(wake_stat, 1, memory_order_relaxed);
    }
@@ -595,25 +666,74 @@ typedef bool (*render_ring_has_work_fn)(void *opaque);
 
 enum render_ring_wait_result {
    RENDER_RING_WAIT_WORK = 0, /* work is (now) visible; go drain */
+   RENDER_RING_WAIT_WOKEN,    /* signalled without work: re-check stop flags */
+   RENDER_RING_WAIT_TIMEOUT,  /* only when timeout_ns >= 0 */
+   RENDER_RING_WAIT_ERROR,
+#ifndef __APPLE__
    RENDER_RING_WAIT_FD0,      /* fd0 readable without work (wake byte only) */
    RENDER_RING_WAIT_FD1,      /* fd1 readable (aux fd: socket / death pipe) */
-   RENDER_RING_WAIT_TIMEOUT,  /* only when timeout_ms >= 0 */
-   RENDER_RING_WAIT_ERROR,
+#endif
 };
 
-/* Consumer side parking.  fd0 is the wake fd (drained after every return
- * from poll); fd1 is an optional extra fd that is reported but never
- * drained.  Caller drains work first; call this when the drain came up
- * empty. */
+/* Consumer side parking on the wake primitive.  The caller drains work
+ * first and calls this when the drain came up empty; aux conditions
+ * (peer exit, stop requests) are turned into a wake signal by the
+ * caller's own monitor, surfacing as RENDER_RING_WAIT_WOKEN. */
 static inline enum render_ring_wait_result
 render_ring_consumer_wait(atomic_uint *state,
-                          int fd0,
-                          int fd1,
+                          render_wake_t wake,
                           render_ring_has_work_fn has_work,
                           void *opaque,
                           uint64_t spin_ns,
-                          int timeout_ms,
+                          int64_t timeout_ns,
                           _Atomic uint64_t *sleep_stat)
+{
+   if (spin_ns) {
+      struct timespec start, now;
+      clock_gettime(CLOCK_MONOTONIC, &start);
+      do {
+         if (has_work(opaque))
+            return RENDER_RING_WAIT_WORK;
+         clock_gettime(CLOCK_MONOTONIC, &now);
+      } while ((uint64_t)(now.tv_sec - start.tv_sec) * 1000000000ull +
+                  (uint64_t)(now.tv_nsec - start.tv_nsec) <
+               spin_ns);
+   }
+
+   atomic_store_explicit(state, RENDER_RING_SLEEPING, memory_order_relaxed);
+   atomic_thread_fence(memory_order_seq_cst);
+   if (has_work(opaque)) {
+      atomic_store_explicit(state, RENDER_RING_ACTIVE, memory_order_relaxed);
+      return RENDER_RING_WAIT_WORK;
+   }
+   if (sleep_stat)
+      atomic_fetch_add_explicit(sleep_stat, 1, memory_order_relaxed);
+
+   const bool signalled = render_wake_wait(wake, timeout_ns);
+
+   atomic_store_explicit(state, RENDER_RING_ACTIVE, memory_order_relaxed);
+
+   if (has_work(opaque))
+      return RENDER_RING_WAIT_WORK;
+   if (!signalled)
+      /* an infinite wait can only return early on error */
+      return timeout_ns < 0 ? RENDER_RING_WAIT_ERROR : RENDER_RING_WAIT_TIMEOUT;
+   return RENDER_RING_WAIT_WOKEN;
+}
+
+#ifndef __APPLE__
+/* Legacy two-fd parking for the non-Apple server path: fd0 is the wake
+ * fd (drained after every return from poll); fd1 is an optional extra fd
+ * that is reported but never drained. */
+static inline enum render_ring_wait_result
+render_ring_consumer_wait_fd(atomic_uint *state,
+                             int fd0,
+                             int fd1,
+                             render_ring_has_work_fn has_work,
+                             void *opaque,
+                             uint64_t spin_ns,
+                             int timeout_ms,
+                             _Atomic uint64_t *sleep_stat)
 {
    if (spin_ns) {
       struct timespec start, now;
@@ -662,5 +782,6 @@ render_ring_consumer_wait(atomic_uint *state,
       return RENDER_RING_WAIT_FD0;
    return RENDER_RING_WAIT_WORK; /* spurious edge; re-drain to be safe */
 }
+#endif /* !__APPLE__ */
 
 #endif /* RENDER_RING_H */

@@ -148,9 +148,12 @@ struct render_context_op_init_request {
    uint32_t lat_ring_offset; /* 0 = no latency trace area */
    uint32_t lat_ring_size;
    struct npt_work_context_config work_context;
-   /* followed by, in order: shmem fd, completion-wake write end,
-    * main-ring wake read end, death-pipe write end, and (only when
-    * oob_ring_size != 0) the oob-ring wake read end. */
+   /* On macOS: followed by the shmem fd only; the wake semaphores are
+    * handed over as registered ports at spawn time and there is no
+    * death pipe.  Elsewhere: followed by, in order, shmem fd,
+    * completion-wake write end, main-ring wake read end, death-pipe
+    * write end, and (only when oob_ring_size != 0) the oob-ring wake
+    * read end. */
 };
 
 /* Export a blob resource from the context

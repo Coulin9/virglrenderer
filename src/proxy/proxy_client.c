@@ -9,6 +9,78 @@
 
 #include "server/render_protocol.h"
 
+#ifdef __APPLE__
+
+#include "proxy_worker.h"
+
+/* On macOS there is no render server: INIT, RESET, CREATE_CONTEXT and
+ * DESTROY_CONTEXT are all handled locally, and the proxy spawns each
+ * context worker itself with the ring wake semaphores as registered
+ * ports. */
+
+bool
+proxy_client_destroy_context(struct proxy_client *client, uint32_t ctx_id)
+{
+   struct proxy_worker *worker = proxy_worker_find(ctx_id);
+   if (worker)
+      proxy_worker_destroy(worker);
+
+   (void)client;
+   return true;
+}
+
+bool
+proxy_client_create_context(struct proxy_client *client,
+                            uint32_t ctx_id,
+                            uint32_t capset_id,
+                            size_t ctx_name_len,
+                            const char *ctx_name,
+                            int *out_ctx_fd,
+                            uint32_t *out_worker_pid,
+                            struct proxy_worker *worker)
+{
+   char name[32];
+   const size_t len = MIN2(ctx_name_len, sizeof(name) - 1);
+   memcpy(name, ctx_name, len);
+   name[len] = 0;
+
+   if (!proxy_worker_spawn(ctx_id, capset_id, name, client->init_flags, worker))
+      return false;
+
+   *out_ctx_fd = worker->ctx_fd;
+   *out_worker_pid = (uint32_t)worker->pid;
+   return true;
+}
+
+bool
+proxy_client_reset(struct proxy_client *client)
+{
+   proxy_worker_kill_all();
+   (void)client;
+   return true;
+}
+
+void
+proxy_client_destroy(struct proxy_client *client)
+{
+   free(client);
+}
+
+struct proxy_client *
+proxy_client_create(struct proxy_server *srv, uint32_t flags)
+{
+   (void)srv;
+
+   struct proxy_client *client = calloc(1, sizeof(*client));
+   if (!client)
+      return NULL;
+
+   client->init_flags = flags;
+   return client;
+}
+
+#else /* !__APPLE__ */
+
 #include "proxy_server.h"
 
 bool
@@ -29,7 +101,8 @@ proxy_client_create_context(struct proxy_client *client,
                             size_t ctx_name_len,
                             const char *ctx_name,
                             int *out_ctx_fd,
-                            uint32_t *out_worker_pid)
+                            uint32_t *out_worker_pid,
+                            UNUSED struct proxy_worker *worker)
 {
    struct render_client_op_create_context_request req = {
       .header.op = RENDER_CLIENT_OP_CREATE_CONTEXT,
@@ -118,3 +191,5 @@ proxy_client_create(struct proxy_server *srv, uint32_t flags)
 
    return client;
 }
+
+#endif /* __APPLE__ */

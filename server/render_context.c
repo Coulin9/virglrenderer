@@ -13,6 +13,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/event.h>
+#endif
+
 #include "util/u_thread.h"
 #include "virgl_util.h"
 
@@ -93,15 +98,16 @@ render_context_update_timeline(struct render_context *ctx,
    render_context_lat_signal(ctx, ring_idx, seqno);
    atomic_store_explicit(&ctx->ring->timelines[ring_idx], seqno,
                          memory_order_release);
-   if (ctx->fence_eventfd < 0)
+   if (ctx->completion_wake == RENDER_WAKE_NULL)
       return;
 
    if (ctx->ring_flags & RENDER_RING_FLAG_ALWAYS_NOTIFY) {
-      render_ring_fd_signal(ctx->fence_eventfd);
+      render_wake_signal(ctx->completion_wake);
       atomic_fetch_add_explicit(&ctx->ring->stats_worker.v.fence_notifies, 1,
                                 memory_order_relaxed);
    } else {
-      render_ring_producer_wake(&ctx->ring->vmm_state.value, ctx->fence_eventfd,
+      render_ring_producer_wake(&ctx->ring->vmm_state.value,
+                                ctx->completion_wake,
                                 &ctx->ring->stats_worker.v.fence_notifies);
    }
 }
@@ -181,12 +187,25 @@ render_context_oob_thread(void *arg)
       if (bad)
          break;
 
+#if defined(__APPLE__)
       const enum render_ring_wait_result res = render_ring_consumer_wait(
-         &ctx->ring->oob_state.value, ctx->oob_wake_read, ctx->oob_stop_read,
+         &ctx->ring->oob_state.value, ctx->oob_wake,
+         render_context_oob_has_work, &consumer, 0 /* spin_ns */,
+         -1 /* timeout */, &ctx->ring->stats_worker.v.oob_sleeps);
+      if (res == RENDER_RING_WAIT_ERROR)
+         break;
+      /* WORK or WOKEN: a stop request arrives via the watcher as a
+       * wake signal */
+      if (atomic_load_explicit(&ctx->stopping, memory_order_acquire))
+         break;
+#else
+      const enum render_ring_wait_result res = render_ring_consumer_wait_fd(
+         &ctx->ring->oob_state.value, ctx->oob_wake, ctx->oob_stop_read,
          render_context_oob_has_work, &consumer, 0 /* spin_ns */,
          -1 /* timeout */, &ctx->ring->stats_worker.v.oob_sleeps);
       if (res == RENDER_RING_WAIT_FD1 || res == RENDER_RING_WAIT_ERROR)
          break;
+#endif
    }
 
    return 0;
@@ -291,8 +310,15 @@ render_context_dispatch_init(struct render_context *ctx,
 
    const struct render_context_op_init_request *req = &request->init;
    const bool has_oob = req->oob_ring_size != 0;
-   if (fd_count != (has_oob ? 5 : 4)) {
-      render_log("INIT: expected %d fds, got %d", has_oob ? 5 : 4, fd_count);
+#if defined(__APPLE__)
+   /* the wake semaphores arrive as registered ports at spawn; INIT
+    * carries only the ring shmem fd */
+   const int expected_fds = 1;
+#else
+   const int expected_fds = has_oob ? 5 : 4;
+#endif
+   if (fd_count != expected_fds) {
+      render_log("INIT: expected %d fds, got %d", expected_fds, fd_count);
       return false;
    }
 
@@ -317,10 +343,12 @@ render_context_dispatch_init(struct render_context *ctx,
    }
 
    const int shmem_fd = fds[0];
+#if !defined(__APPLE__)
    const int fence_eventfd = fds[1];
    const int main_wake_read = fds[2];
    const int death_write_fd = fds[3];
    const int oob_wake_read = has_oob ? fds[4] : -1;
+#endif
 
    void *shmem_ptr =
       mmap(NULL, req->shmem_size, PROT_READ | PROT_WRITE, MAP_SHARED, shmem_fd, 0);
@@ -347,10 +375,12 @@ render_context_dispatch_init(struct render_context *ctx,
                            req->main_ring_size);
    ctx->timeline_count = RENDER_RING_TIMELINE_COUNT;
 
-   ctx->fence_eventfd = fence_eventfd;
-   ctx->main_wake_read = main_wake_read;
+#if !defined(__APPLE__)
+   ctx->completion_wake = fence_eventfd;
+   ctx->main_wake = main_wake_read;
    ctx->death_write_fd = death_write_fd;
-   ctx->oob_wake_read = oob_wake_read;
+   ctx->oob_wake = oob_wake_read;
+#endif
 
    if ((req->ring_flags & RENDER_RING_FLAG_LATENCY_TRACE) &&
        req->lat_ring_size)
@@ -360,6 +390,7 @@ render_context_dispatch_init(struct render_context *ctx,
       ctx->oob_ring = render_ring_oob_buf(ctx->ring, shmem_ptr,
                                           req->oob_ring_offset,
                                           req->oob_ring_size);
+#if !defined(__APPLE__)
       if (create_fence_pipe(&ctx->oob_stop_read, &ctx->oob_stop_write)) {
          render_log("INIT: failed to create oob stop pipe");
          munmap(shmem_ptr, req->shmem_size);
@@ -367,13 +398,16 @@ render_context_dispatch_init(struct render_context *ctx,
          ctx->ring = NULL;
          return false;
       }
+#endif
       if (thrd_create(&ctx->oob_thread, render_context_oob_thread, ctx) !=
           thrd_success) {
          render_log("INIT: oob thread creation failed");
+#if !defined(__APPLE__)
          close(ctx->oob_stop_read);
          close(ctx->oob_stop_write);
          ctx->oob_stop_read = -1;
          ctx->oob_stop_write = -1;
+#endif
          munmap(shmem_ptr, req->shmem_size);
          ctx->shmem_ptr = NULL;
          ctx->ring = NULL;
@@ -569,10 +603,26 @@ render_context_ring_run(struct render_context *ctx)
       }
       render_ring_commit(&ctx->main_ring, consumer.head);
 
+#if defined(__APPLE__)
+      /* ring drained: park on the wake semaphore.  The watcher thread
+       * turns VMM exit / socket EOF / stray socket data into stopping
+       * plus a semaphore signal. */
+      const enum render_ring_wait_result res = render_ring_consumer_wait(
+         &ctx->ring->main_state.value, ctx->main_wake,
+         render_context_main_has_work, &consumer, spin_ns, -1 /* timeout */,
+         &ctx->ring->stats_worker.v.main_sleeps);
+      if (res == RENDER_RING_WAIT_ERROR)
+         return false;
+
+      const int stopping =
+         atomic_load_explicit(&ctx->stopping, memory_order_acquire);
+      if (stopping)
+         return stopping == 1; /* 1 = clean close, 2 = protocol error */
+#else
       /* ring drained: park on the wake fd, also watching the socket so a
        * VMM close is noticed while we sleep */
-      const enum render_ring_wait_result res = render_ring_consumer_wait(
-         &ctx->ring->main_state.value, ctx->main_wake_read, ctx->socket.fd,
+      const enum render_ring_wait_result res = render_ring_consumer_wait_fd(
+         &ctx->ring->main_state.value, ctx->main_wake, ctx->socket.fd,
          render_context_main_has_work, &consumer, spin_ns, -1 /* timeout */,
          &ctx->ring->stats_worker.v.main_sleeps);
       if (res == RENDER_RING_WAIT_ERROR)
@@ -595,6 +645,7 @@ render_context_ring_run(struct render_context *ctx)
             return false;
          }
       }
+#endif
    }
 
    return true;
@@ -619,20 +670,27 @@ render_context_fini(struct render_context *ctx)
    /* stop the oob consumer before the backend context goes away: its
     * thread calls into render_state and must be joined first */
    if (ctx->oob_thread_created) {
+#if defined(__APPLE__)
+      atomic_store_explicit(&ctx->stopping, 1, memory_order_release);
+      render_wake_signal(ctx->oob_wake);
+#else
       write_eventfd(ctx->oob_stop_write, 1);
+#endif
       thrd_join(ctx->oob_thread, NULL);
       ctx->oob_thread_created = false;
    }
+#if !defined(__APPLE__)
    if (ctx->oob_stop_read >= 0)
       close(ctx->oob_stop_read);
    if (ctx->oob_stop_write >= 0)
       close(ctx->oob_stop_write);
-   if (ctx->oob_wake_read >= 0)
-      close(ctx->oob_wake_read);
-   if (ctx->main_wake_read >= 0)
-      close(ctx->main_wake_read);
+   if (ctx->oob_wake != RENDER_WAKE_NULL)
+      close(ctx->oob_wake);
+   if (ctx->main_wake != RENDER_WAKE_NULL)
+      close(ctx->main_wake);
    if (ctx->death_write_fd >= 0)
       close(ctx->death_write_fd);
+#endif
 
    /* destroy the context first to join its sync threads and ring threads */
    render_state_destroy_context(ctx->ctx_id);
@@ -642,8 +700,29 @@ render_context_fini(struct render_context *ctx)
    if (ctx->shmem_fd >= 0)
       close(ctx->shmem_fd);
 
-   if (ctx->fence_eventfd >= 0)
-      close(ctx->fence_eventfd);
+#if !defined(__APPLE__)
+   if (ctx->completion_wake != RENDER_WAKE_NULL)
+      close(ctx->completion_wake);
+#else
+   if (ctx->watcher_created) {
+      /* ask the watcher to leave its kevent loop and join it */
+      struct kevent kev;
+      EV_SET(&kev, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+      kevent(ctx->watcher_kq, &kev, 1, NULL, 0, NULL);
+      thrd_join(ctx->watcher_thread, NULL);
+      ctx->watcher_created = false;
+   }
+   if (ctx->watcher_kq >= 0)
+      close(ctx->watcher_kq);
+   /* our send rights on the wake semaphores die with the task; drop
+    * them now so a long-lived test process does not leak them */
+   if (ctx->main_wake != RENDER_WAKE_NULL)
+      mach_port_deallocate(mach_task_self(), ctx->main_wake);
+   if (ctx->oob_wake != RENDER_WAKE_NULL)
+      mach_port_deallocate(mach_task_self(), ctx->oob_wake);
+   if (ctx->completion_wake != RENDER_WAKE_NULL)
+      mach_port_deallocate(mach_task_self(), ctx->completion_wake);
+#endif
 
    if (ctx->name)
       free(ctx->name);
@@ -719,6 +798,141 @@ render_context_init_name(struct render_context *ctx,
    return true;
 }
 
+#if defined(__APPLE__)
+
+/* Watch the VMM through a kqueue so a dead or closing peer can never
+ * strand the parked ring consumers: EVFILT_PROC NOTE_EXIT on the parent
+ * and EVFILT_READ EV_EOF on the context socket both become a stop
+ * request plus a semaphore signal.  Stray socket data while the main
+ * consumer is parked on an empty ring is a protocol violation: the VMM
+ * always publishes a SOCKET_REQUEST marker before socket bytes, and a
+ * published marker makes the ring non-empty while a consumed marker is
+ * being serviced with the consumer state still ACTIVE/WAKING -- so
+ * SLEEPING + empty ring + readable data can only be stray. */
+static int
+render_context_watcher_thread(void *arg)
+{
+   struct render_context *ctx = arg;
+   u_thread_setname("virgl-watch");
+
+   int reason = 0;
+   for (;;) {
+      struct kevent ev;
+      const int n = kevent(ctx->watcher_kq, NULL, 0, &ev, 1, NULL);
+      if (n < 0) {
+         if (errno == EINTR)
+            continue;
+         break;
+      }
+      if (n == 0)
+         continue;
+      if (ev.filter == EVFILT_USER)
+         break; /* fini */
+      if (ev.filter == EVFILT_PROC) {
+         if (ev.fflags & NOTE_EXIT)
+            reason = 1;
+         break;
+      }
+      if (ev.filter == EVFILT_READ) {
+         if (ev.flags & EV_EOF) {
+            reason = 1;
+            break;
+         }
+         /* ev.data is the pending byte count: stray socket data while
+          * the main consumer is parked on an empty ring is a protocol
+          * violation (a SOCKET_REQUEST marker would keep the ring
+          * non-empty, and a consumed marker being serviced leaves the
+          * consumer state ACTIVE/WAKING) */
+         if (ev.data > 0 && ctx->ring &&
+             atomic_load_explicit(&ctx->ring->main_state.value,
+                                  memory_order_acquire) == RENDER_RING_SLEEPING &&
+             !render_ring_has_entries(
+                &ctx->main_ring,
+                atomic_load_explicit(ctx->main_ring.head,
+                                     memory_order_acquire))) {
+            render_log("context socket: unexpected data; terminating");
+            reason = 2;
+            break;
+         }
+      }
+   }
+
+   if (reason) {
+      atomic_store_explicit(&ctx->stopping, reason, memory_order_release);
+      render_wake_signal(ctx->main_wake);
+      render_wake_signal(ctx->oob_wake);
+   }
+
+   return 0;
+}
+
+static bool
+render_context_watcher_start(struct render_context *ctx)
+{
+   ctx->watcher_kq = kqueue();
+   if (ctx->watcher_kq < 0) {
+      render_log("failed to create peer watcher kqueue");
+      return false;
+   }
+
+   struct kevent kev[3];
+   EV_SET(&kev[0], getppid(), EVFILT_PROC, EV_ADD | EV_ENABLE, NOTE_EXIT, 0,
+          NULL);
+   EV_SET(&kev[1], ctx->socket.fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
+          NULL);
+   EV_SET(&kev[2], 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+   if (kevent(ctx->watcher_kq, kev, ARRAY_SIZE(kev), NULL, 0, NULL)) {
+      /* ESRCH: the VMM already exited */
+      if (errno == ESRCH) {
+         render_log("VMM already gone at watcher start; exiting");
+         close(ctx->watcher_kq);
+         ctx->watcher_kq = -1;
+         return false;
+      }
+      render_log("failed to register peer watcher: %s", strerror(errno));
+      close(ctx->watcher_kq);
+      ctx->watcher_kq = -1;
+      return false;
+   }
+
+   if (thrd_create(&ctx->watcher_thread, render_context_watcher_thread,
+                   ctx) != thrd_success) {
+      render_log("failed to create peer watcher thread");
+      close(ctx->watcher_kq);
+      ctx->watcher_kq = -1;
+      return false;
+   }
+   ctx->watcher_created = true;
+   return true;
+}
+
+/* Retrieve the wake semaphores the VMM handed over at spawn time as this
+ * task's registered ports (RENDER_WAKE_PORT_* order). */
+static bool
+render_context_lookup_wake_ports(struct render_context *ctx)
+{
+   mach_port_array_t ports = NULL;
+   mach_msg_type_number_t count = 0;
+   const kern_return_t kr =
+      mach_ports_lookup(mach_task_self(), &ports, &count);
+   if (kr != KERN_SUCCESS || count < RENDER_WAKE_PORT_COUNT ||
+       !ports[RENDER_WAKE_PORT_MAIN] || !ports[RENDER_WAKE_PORT_OOB] ||
+       !ports[RENDER_WAKE_PORT_COMPLETION]) {
+      render_log("missing registered wake ports (kr %d, count %u)", (int)kr,
+                 (unsigned)count);
+      return false;
+   }
+
+   ctx->main_wake = ports[RENDER_WAKE_PORT_MAIN];
+   ctx->oob_wake = ports[RENDER_WAKE_PORT_OOB];
+   ctx->completion_wake = ports[RENDER_WAKE_PORT_COMPLETION];
+   vm_deallocate(mach_task_self(), (vm_address_t)ports,
+                 count * sizeof(mach_port_t));
+   return true;
+}
+
+#endif /* __APPLE__ */
+
 static bool
 render_context_init(struct render_context *ctx, const struct render_context_args *args)
 {
@@ -726,15 +940,26 @@ render_context_init(struct render_context *ctx, const struct render_context_args
    ctx->ctx_id = args->ctx_id;
    render_socket_init(&ctx->socket, args->ctx_fd);
    ctx->shmem_fd = -1;
-   ctx->fence_eventfd = -1;
-   ctx->main_wake_read = -1;
-   ctx->oob_wake_read = -1;
+   ctx->completion_wake = RENDER_WAKE_NULL;
+   ctx->main_wake = RENDER_WAKE_NULL;
+   ctx->oob_wake = RENDER_WAKE_NULL;
+#if defined(__APPLE__)
+   ctx->watcher_kq = -1;
+#else
    ctx->death_write_fd = -1;
    ctx->oob_stop_read = -1;
    ctx->oob_stop_write = -1;
+#endif
 
    if (!render_context_init_name(ctx, args->ctx_id, args->ctx_name))
       return false;
+
+#if defined(__APPLE__)
+   if (!render_context_lookup_wake_ports(ctx))
+      return false;
+   if (!render_context_watcher_start(ctx))
+      return false;
+#endif
 
    return true;
 }

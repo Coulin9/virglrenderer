@@ -35,6 +35,16 @@ foreach t : ring_tests
    test(t[0], test_ring)
 endforeach
 
+# The proxy child monitor is self-contained; test it directly.
+if host_machine.system() == 'darwin'
+   test_proxy_monitor = executable(
+      'test_proxy_monitor',
+      ['test_proxy_monitor.c', '../src/proxy/proxy_monitor.c'],
+      include_directories : include_directories(
+         '..', '../src', '../src/mesa/compat'))
+   test('test_proxy_monitor', test_proxy_monitor)
+endif
+
 if check_dep.found()
 
 libvrtest_sources = [

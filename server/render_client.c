@@ -9,6 +9,7 @@
 
 #include "render_context.h"
 #include "render_server.h"
+#include "render_spawn.h"
 #include "render_worker.h"
 #include "virglrenderer.h"
 #include "virtgpu_drm.h"
@@ -83,32 +84,9 @@ init_context_args(struct render_context_args *ctx_args,
                   const struct render_client_op_create_context_request *req,
                   int ctx_fd)
 {
-   /* A worker services a single context, so it only needs that context's
-    * backend.  Scoping the flags keeps a worker from bringing up a backend it
-    * will never use -- e.g. an x86_64 neptune worker must not also initialize
-    * venus, which render_state_init treats as fatal if it fails. */
-   const uint32_t backends = VIRGL_RENDERER_VENUS | VIRGL_RENDERER_NEPTUNE;
-   uint32_t worker_flags = init_flags;
-   switch (req->capset_id) {
-   case VIRTGPU_DRM_CAPSET_VENUS:
-      worker_flags = (init_flags & ~backends) | VIRGL_RENDERER_VENUS;
-      break;
-   case VIRTGPU_DRM_CAPSET_NEPTUNE:
-      worker_flags = (init_flags & ~backends) | VIRGL_RENDERER_NEPTUNE;
-      break;
-   default:
-      break;
-   }
-
-   *ctx_args = (struct render_context_args){
-      .valid = true,
-      .init_flags = worker_flags,
-      .ctx_id = req->ctx_id,
-      .ctx_fd = ctx_fd,
-   };
-
    static_assert(sizeof(ctx_args->ctx_name) == sizeof(req->ctx_name), "");
-   memcpy(ctx_args->ctx_name, req->ctx_name, sizeof(req->ctx_name) - 1);
+   render_init_context_args(ctx_args, init_flags, req->capset_id, req->ctx_id,
+                            req->ctx_name, sizeof(req->ctx_name) - 1, ctx_fd);
 }
 
 #ifdef ENABLE_RENDER_SERVER_WORKER_THREAD

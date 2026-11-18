@@ -452,97 +452,13 @@ render_worker_jail_detach_workers(struct render_worker_jail *jail)
 
 #if defined(ENABLE_RENDER_SERVER_WORKER_PROCESS) && defined(__APPLE__)
 
-#include <crt_externs.h>
-#include <mach/machine.h>
-#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "render_context.h"
-#include "neptune/npt_library_names.h"
+#include "render_spawn.h"
 #include "virglrenderer.h"
-
-/* On macOS, fork() without exec() inherits stale XPC connections
- * (Mach port based), breaking Metal shader compilation in worker
- * subprocesses.  posix_spawn() atomically creates a fresh process
- * image without an intermediate forked state.
- *
- * POSIX_SPAWN_CLOEXEC_DEFAULT closes all fds by default in the child;
- * only ctx_fd is explicitly inherited via addinherit_np.
- */
-
-static pid_t
-render_worker_spawn(const struct render_context_args *ctx_args)
-{
-   /* for devenv without installing server */
-   char *const server_path = getenv("RENDER_SERVER_EXEC_PATH");
-   const char *exec_path = server_path ? server_path : RENDER_SERVER_EXEC_PATH;
-
-   char fd_str[16];
-   char id_str[16];
-   char flags_str[16];
-   snprintf(fd_str, sizeof(fd_str), "%d", ctx_args->ctx_fd);
-   snprintf(id_str, sizeof(id_str), "%u", ctx_args->ctx_id);
-   snprintf(flags_str, sizeof(flags_str), "%u", ctx_args->init_flags);
-
-   char *const argv[] = {
-      (char *)exec_path,
-      "--worker-context-fd",
-      fd_str,
-      "--worker-context-id",
-      id_str,
-      "--worker-context-init-flags",
-      flags_str,
-      "--worker-context-name",
-      (char *)ctx_args->ctx_name,
-      NULL,
-   };
-
-   posix_spawnattr_t attr;
-   if (posix_spawnattr_init(&attr) != 0)
-      return -1;
-   posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
-
-   /* Venus, DXMT and Mullion use arm64. D3DMetal uses x86_64 under Rosetta.
-    * CPU_TYPE_ANY lets a thin build fall back to its available slice. */
-   cpu_type_t worker_arch = CPU_TYPE_ARM64;
-   if (ctx_args->init_flags & VIRGL_RENDERER_NEPTUNE) {
-      const char *backend = getenv("NPT_BACKEND");
-      const bool use_dxmt = backend && !strcmp(backend, "dxmt");
-      const bool native_backend = use_dxmt || npt_mullion_selected();
-      if (backend && *backend && !native_backend && strcmp(backend, "d3dmetal"))
-         render_log("unknown NPT_BACKEND '%s', using d3dmetal", backend);
-      worker_arch = native_backend ? CPU_TYPE_ARM64 : CPU_TYPE_X86_64;
-   }
-   cpu_type_t cpu_pref[] = { worker_arch, CPU_TYPE_ANY };
-   cpu_subtype_t cpu_subpref[] = { CPU_SUBTYPE_ANY, CPU_SUBTYPE_ANY };
-   size_t ocount = 0;
-   posix_spawnattr_setarchpref_np(&attr, 2, cpu_pref, cpu_subpref, &ocount);
-
-   posix_spawn_file_actions_t file_actions;
-   if (posix_spawn_file_actions_init(&file_actions) != 0) {
-      posix_spawnattr_destroy(&attr);
-      return -1;
-   }
-   posix_spawn_file_actions_addinherit_np(&file_actions, STDIN_FILENO);
-   posix_spawn_file_actions_addinherit_np(&file_actions, STDOUT_FILENO);
-   posix_spawn_file_actions_addinherit_np(&file_actions, STDERR_FILENO);
-   posix_spawn_file_actions_addinherit_np(&file_actions, ctx_args->ctx_fd);
-
-   pid_t pid;
-   int ret = posix_spawn(&pid, exec_path, &file_actions, &attr, argv, *_NSGetEnviron());
-
-   posix_spawn_file_actions_destroy(&file_actions);
-   posix_spawnattr_destroy(&attr);
-
-   if (ret != 0) {
-      render_log("posix_spawn failed: %s", strerror(ret));
-      return -1;
-   }
-
-   return pid;
-}
 
 #endif /* ENABLE_RENDER_SERVER_WORKER_PROCESS && __APPLE__ */
 
@@ -569,7 +485,7 @@ render_worker_create(struct render_worker_jail *jail,
    {
       const struct render_context_args *ctx_args =
          (const struct render_context_args *)worker->thread_data;
-      worker->pid = render_worker_spawn(ctx_args);
+      worker->pid = render_spawn_worker(ctx_args, NULL);
       ok = worker->pid >= 0;
    }
 #else

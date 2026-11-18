@@ -29,6 +29,16 @@ proxy_renderer_init(const struct proxy_renderer_cbs *cbs, uint32_t flags)
    proxy_renderer.cbs = cbs;
    proxy_renderer.flags = flags;
 
+#ifdef __APPLE__
+   /* No render server process: the proxy spawns each context worker
+    * directly with registered Mach semaphores. */
+   if (cbs->get_server_fd)
+      proxy_log("get_server_fd ignored: workers are spawned directly");
+
+   proxy_renderer.client = proxy_client_create(NULL, proxy_renderer.flags);
+   if (!proxy_renderer.client)
+      goto fail;
+#else
    proxy_renderer.server = proxy_server_create();
    if (!proxy_renderer.server)
       goto fail;
@@ -37,6 +47,7 @@ proxy_renderer_init(const struct proxy_renderer_cbs *cbs, uint32_t flags)
       proxy_client_create(proxy_renderer.server, proxy_renderer.flags);
    if (!proxy_renderer.client)
       goto fail;
+#endif
 
    return 0;
 

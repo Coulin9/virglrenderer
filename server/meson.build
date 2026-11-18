@@ -8,6 +8,7 @@ virgl_render_server_sources = [
    'render_context.c',
    'render_server.c',
    'render_socket.c',
+   'render_spawn.c',
    'render_state.c',
    'render_worker.c',
 ]
