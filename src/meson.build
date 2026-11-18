@@ -114,6 +114,7 @@ neptune_sources = [
    'neptune/npt_cs.c',
    'neptune/npt_feedback.c',
    'neptune/npt_event.c',
+   'neptune/npt_event_fd.c',
    'neptune/npt_heap12.c',
    'neptune/npt_library.c',
    'neptune/npt_profile.c',

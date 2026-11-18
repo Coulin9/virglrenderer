@@ -7,161 +7,14 @@
 
 #include "npt_com.h"
 #include "npt_context.h"
-#include "npt_library.h"
-#include "npt_renderer.h"
 #include "neptune-protocol/npt_protocol_transport.h"
 
 #include "util/hash_table.h"
 #include "util/list.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
-#if defined(__linux__)
-#include <sys/eventfd.h>
-#endif
-
-static int
-event_fd_create(struct npt_event_fd *out)
-{
-#if defined(__linux__)
-   out->fd = eventfd(0, EFD_CLOEXEC);
-   return out->fd < 0 ? -1 : 0;
-#elif defined(__APPLE__)
-   struct npt_d3d_library *lib = npt_renderer_get_library();
-   if (!lib || !lib->pfn_event_create) {
-      npt_log("event: backend event API unavailable");
-      return -1;
-   }
-   /* Manual-reset matches Win32's default for guest-created HANDLEs
-    * (we don't auto-clear on read). */
-   out->handle = lib->pfn_event_create(/*manual_reset=*/1, /*initial_state=*/0);
-   return out->handle ? 0 : -1;
-#else
-   /* Prefer pipe2(O_CLOEXEC) where available (Linux, FreeBSD) to
-    * avoid the fd-leak window between pipe() and fcntl().  Fall back
-    * to pipe() + fcntl() on platforms without pipe2. */
-   int fds[2];
-#ifdef HAVE_PIPE2
-   if (pipe2(fds, O_CLOEXEC) == 0) {
-      out->read_fd = fds[0];
-      out->write_fd = fds[1];
-      return 0;
-   }
-   if (errno != ENOSYS)
-      return -1;
-#endif
-   if (pipe(fds) != 0)
-      return -1;
-   /* Best-effort CLOEXEC: non-fatal, fds remain usable on failure. */
-   for (int i = 0; i < 2; i++) {
-      int flags = fcntl(fds[i], F_GETFD);
-      if (flags >= 0)
-         fcntl(fds[i], F_SETFD, flags | FD_CLOEXEC);
-   }
-   out->read_fd = fds[0];
-   out->write_fd = fds[1];
-   return 0;
-#endif
-}
-
-static void
-event_fd_destroy(struct npt_event_fd *fd)
-{
-#if defined(__linux__)
-   if (fd->fd >= 0) {
-      close(fd->fd);
-      fd->fd = -1;
-   }
-#elif defined(__APPLE__)
-   if (fd->handle) {
-      struct npt_d3d_library *lib = npt_renderer_get_library();
-      if (lib && lib->pfn_event_close)
-         lib->pfn_event_close(fd->handle);
-      fd->handle = NULL;
-   }
-#else
-   if (fd->read_fd >= 0) {
-      close(fd->read_fd);
-      fd->read_fd = -1;
-   }
-   if (fd->write_fd >= 0) {
-      close(fd->write_fd);
-      fd->write_fd = -1;
-   }
-#endif
-}
-
-/* The value handed to the host as the HANDLE; SetEvent acts on it.
- * An fd cast to a pointer on eventfd/pipe platforms, the backend's
- * event handle on darwin. */
-static void *
-event_fd_signal_handle(const struct npt_event_fd *fd)
-{
-#if defined(__linux__)
-   return fd->fd >= 0 ? (void *)(uintptr_t)fd->fd : NULL;
-#elif defined(__APPLE__)
-   return fd->handle;
-#else
-   return fd->write_fd >= 0 ? (void *)(uintptr_t)fd->write_fd : NULL;
-#endif
-}
-
-/* Caller polls + closes the returned dup.
- *
- * Always non-blocking: a ring's gate event is shared by every gate on
- * it, so the sync worker cannot know how many wakeups are queued and
- * has to drain with a read loop that ends on EAGAIN.  A blocking fd
- * would park that worker in read() with the whole queue behind it. */
-static int
-event_fd_dup_wait_fd(const struct npt_event_fd *fd)
-{
-#if defined(__linux__)
-   int wait_fd = dup(fd->fd);
-#elif defined(__APPLE__)
-   struct npt_d3d_library *lib = npt_renderer_get_library();
-   int wait_fd = (lib && lib->pfn_event_dup_fd)
-                    ? lib->pfn_event_dup_fd(fd->handle) : -1;
-#else
-   int wait_fd = dup(fd->read_fd);
-#endif
-   if (wait_fd < 0)
-      return -1;
-
-   const int flags = fcntl(wait_fd, F_GETFL);
-   if (flags < 0 || fcntl(wait_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-      npt_log("event: O_NONBLOCK on the wait fd failed: %s", strerror(errno));
-      close(wait_fd);
-      return -1;
-   }
-   return wait_fd;
-}
-
-static void
-event_fd_init_invalid(struct npt_event_fd *fd)
-{
-#if defined(__linux__)
-   fd->fd = -1;
-#elif defined(__APPLE__)
-   fd->handle = NULL;
-#else
-   fd->read_fd = -1;
-   fd->write_fd = -1;
-#endif
-}
-
-static bool
-event_fd_is_valid(const struct npt_event_fd *fd)
-{
-#if defined(__linux__)
-   return fd->fd >= 0;
-#elif defined(__APPLE__)
-   return fd->handle != NULL;
-#else
-   return fd->read_fd >= 0;
-#endif
-}
 
 static uint32_t
 tok_hash(const void *key)
@@ -195,7 +48,7 @@ npt_event_init(struct npt_context *ctx)
    list_inithead(&ctx->event_pending_fences);
    npt_completion_producer_init(&ctx->evt_producer);
    for (unsigned i = 0; i < ARRAY_SIZE(ctx->gate_ring); i++)
-      event_fd_init_invalid(&ctx->gate_ring[i]);
+      npt_event_fd_init_invalid(&ctx->gate_ring[i]);
    return true;
 }
 
@@ -245,21 +98,21 @@ npt_event_fini(struct npt_context *ctx)
 
    hash_table_foreach(ctx->event_proxies, entry) {
       struct npt_event_proxy *pr = entry->data;
-      event_fd_destroy(&pr->proxy);
+      npt_event_fd_destroy(&pr->proxy);
       free(pr);
    }
    _mesa_hash_table_destroy(ctx->event_proxies, NULL);
    ctx->event_proxies = NULL;
 
    for (unsigned i = 0; i < ARRAY_SIZE(ctx->gate_ring); i++) {
-      if (!event_fd_is_valid(&ctx->gate_ring[i]))
+      if (!npt_event_fd_is_valid(&ctx->gate_ring[i]))
          continue;
       if (gate_pinned[i])
          npt_log("event_fini: ring %u gate event kept open; a fence "
                  "registration on it can still fire", i);
       else
-         event_fd_destroy(&ctx->gate_ring[i]);
-      event_fd_init_invalid(&ctx->gate_ring[i]);
+         npt_event_fd_destroy(&ctx->gate_ring[i]);
+      npt_event_fd_init_invalid(&ctx->gate_ring[i]);
    }
 
    mtx_unlock(&ctx->event_mutex);
@@ -296,14 +149,14 @@ event_proxy_create_locked(struct npt_context *ctx, uint64_t token,
                           uint32_t initial_refcount)
 {
    struct npt_event_fd hfd;
-   event_fd_init_invalid(&hfd);
-   if (event_fd_create(&hfd) < 0) {
+   npt_event_fd_init_invalid(&hfd);
+   if (npt_event_fd_create(&hfd) < 0) {
       npt_log("event: fd create failed: %s", strerror(errno));
       return NULL;
    }
    struct npt_event_proxy *pr = calloc(1, sizeof(*pr));
    if (!pr) {
-      event_fd_destroy(&hfd);
+      npt_event_fd_destroy(&hfd);
       return NULL;
    }
    pr->token    = token;
@@ -388,7 +241,7 @@ npt_event_arm_mode(struct npt_context *ctx, uint64_t token,
     * can undo it (freeing a just-lazy-created proxy) via the unref helper. */
    pr->refcount++;
 
-   int dup_fd = event_fd_dup_wait_fd(&pr->proxy);
+   int dup_fd = npt_event_fd_dup_wait_fd(&pr->proxy);
    if (dup_fd < 0) {
       npt_log("event: dup(proxy wait fd) failed: %s", strerror(errno));
       npt_event_proxy_unref_locked(ctx, pr, NULL);
@@ -473,7 +326,7 @@ npt_event_arm_queue(struct npt_context *ctx, uint64_t token,
     * entry and is released after retirement. */
    pr->refcount++;
 
-   int dup_fd = event_fd_dup_wait_fd(&pr->proxy);
+   int dup_fd = npt_event_fd_dup_wait_fd(&pr->proxy);
    if (dup_fd < 0) {
       npt_log("event: dup(proxy wait fd) failed: %s", strerror(errno));
       npt_event_proxy_unref_locked(ctx, pr, NULL);
@@ -542,7 +395,7 @@ npt_event_proxy_unref_locked(struct npt_context *ctx,
    if (--pr->refcount > 0)
       return;
 
-   event_fd_destroy(&pr->proxy);
+   npt_event_fd_destroy(&pr->proxy);
    event_seoc_release_all(pr->seoc_fences, pr->seoc_fence_count);
    pr->seoc_fences = NULL;
    pr->seoc_fence_count = 0;
@@ -568,14 +421,14 @@ npt_event_gate_wait(struct npt_context *ctx, void *fence, uint64_t value,
 
    mtx_lock(&ctx->event_mutex);
    struct npt_event_fd *gate = &ctx->gate_ring[ring_idx];
-   if (!event_fd_is_valid(gate) && event_fd_create(gate) < 0) {
-      event_fd_init_invalid(gate);
+   if (!npt_event_fd_is_valid(gate) && npt_event_fd_create(gate) < 0) {
+      npt_event_fd_init_invalid(gate);
       mtx_unlock(&ctx->event_mutex);
       npt_log("gate_wait: gate event create failed: %s", strerror(errno));
       return false;
    }
 
-   int dup_fd = event_fd_dup_wait_fd(gate);
+   int dup_fd = npt_event_fd_dup_wait_fd(gate);
    if (dup_fd < 0) {
       mtx_unlock(&ctx->event_mutex);
       npt_log("gate_wait: dup(gate wait fd) failed: %s", strerror(errno));
@@ -586,7 +439,7 @@ npt_event_gate_wait(struct npt_context *ctx, void *fence, uint64_t value,
     * instant fire is observable on the first poll.  The library only
     * borrows the signal handle, which the per-ring gate keeps alive. */
    npt_d3d12_gate_addref(fence);
-   if (!npt_d3d12_gate_seoc(fence, value, event_fd_signal_handle(gate))) {
+   if (!npt_d3d12_gate_seoc(fence, value, npt_event_fd_signal_handle(gate))) {
       npt_d3d12_gate_release(fence);
       close(dup_fd);
       mtx_unlock(&ctx->event_mutex);
@@ -894,7 +747,7 @@ npt_event_replace_by_token(struct npt_dispatch_context *dispatch,
 
    mtx_lock(&ctx->event_mutex);
    struct npt_event_proxy *pr = lookup_locked(ctx, token);
-   void *ret = pr ? event_fd_signal_handle(&pr->proxy) : NULL;
+   void *ret = pr ? npt_event_fd_signal_handle(&pr->proxy) : NULL;
    event_cmd_proxy = pr;
    if (pr) {
       if (event_cmd_pins.count < NPT_EVENT_MAX_PINS_PER_CMD) {

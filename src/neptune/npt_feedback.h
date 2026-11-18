@@ -3,17 +3,18 @@
  * SPDX-License-Identifier: MIT
  *
  * Per-context shared-memory feedback substrate.  One registry, one
- * pending list, one rate-limited poll loop, dispatched by
- * `entry->type` to a per-type poller.  Three sections, both here and
+ * pending list, one rate-limited poll loop for queries, plus an
+ * event-driven watcher for fences.  Three sections, both here and
  * in the matching .c:
- *   1. Substrate — registry, pending list, poll loop, generic ops.
+ *   1. Substrate — registry, pending list, poll loop, fence watcher,
+ *      generic ops.
  *   2. Query feedback — D3D11 ID3D11Query lifecycle and poller.
- *   3. Fence feedback — ID3D11Fence lifecycle and poller.
+ *   3. Fence feedback — ID3D11Fence/ID3D12Fence lifecycle, armed on
+ *      Signal via SetEventOnCompletion and refreshed by the watcher.
  *
  * Per-type modules own the lifecycle hooks (queries: Begin/End in
  * npt_overrides_d3d11_query.c; fences: Signal in
- * npt_overrides_d3d11_fence.c) plus a static poll function dispatched
- * by the substrate.
+ * npt_overrides_d3d11_fence.c and npt_overrides_d3d12_fence.c).
  */
 #ifndef NPT_FEEDBACK_H
 #define NPT_FEEDBACK_H
@@ -23,6 +24,8 @@
 
 #include "c11/threads.h"
 #include "util/list.h"
+
+#include "npt_event.h"
 
 struct hash_table;
 struct npt_context;
@@ -59,21 +62,37 @@ enum npt_feedback_type {
  *               role itself.
  *   persistent  True for fences: the entry lives in the TABLE for the
  *               object's lifetime (until UNREGISTER).  This says nothing
- *               about the pending list -- see target_value.  False for
- *               queries (one Begin/End cycle = one poll = one removal).
- *   target_value Fences only: highest value passed to Signal.  The
- *               entry leaves the pending list once completed_value
- *               reaches it, so pending_count means "polls still owed"
- *               rather than "a fence exists"; the next Signal re-arms it.
+ *               about the pending list -- fences never enter it.  False
+ *               for queries (one Begin/End cycle = one poll = one
+ *               removal).
+ *   target_value Fences only: highest value passed to Signal.  A
+ *               requested Signal below it latches `rewound`.
  *   published_high Fences only: highest value ever written to the slot,
  *               used to notice a rewind -- see `rewound`.
- *   rewound     Fences only, sticky: the host observed the fence go
- *               backwards, which D3D12 permits.  Such an entry stops
- *               owing polls, and the guest reads that fence over the
- *               wire instead of from its slot.
- *   pending     True while in the per-state pending list.
+ *   rewound     Fences only, sticky: the fence may go backwards -- a
+ *               requested Signal value below target, a second distinct
+ *               signalling queue, or an observed decrease.  Such an
+ *               entry stops arming, and the guest reads that fence over
+ *               the wire instead of from its slot.
+ *   pending     True while in the per-state pending list (queries
+ *               only; fences are event-driven and never enter it).
  *   pending_head List node into npt_feedback_state::pending.
+ *
+ *   Fence-only arm fields:
+ *   first_queue Identity (host queue/context pointer) of the first
+ *               queue to signal this fence, CAS-installed.  A second
+ *               distinct queue latches rewound.
+ *   armed_value Highest value armed on arm_event via
+ *               SetEventOnCompletion; only increasing values re-arm.
+ *   arm_event   Host event object of the same kind the event-proxy
+ *               path hands to D3DMetal's SetEventOnCompletion.
+ *   arm_event_valid
+ *   watch       The feedback watcher's record for this entry's wait
+ *               fd (owned and freed by the watcher thread once marked
+ *               dead).
  */
+struct npt_feedback_watch;
+
 struct npt_feedback_entry {
    uint64_t obj_id;
    uint8_t  type;
@@ -92,11 +111,30 @@ struct npt_feedback_entry {
    uint64_t target_value;
    uint64_t published_high;
 
+   uintptr_t first_queue;
+   uint64_t armed_value;
+   struct npt_event_fd arm_event;
+   bool     arm_event_valid;
+   struct npt_feedback_watch *watch;
+
    bool persistent;
    bool pending;
    bool rewound;
    bool live;
    struct list_head pending_head;
+};
+
+/* One watched fence per record: the dup'd wait fd the watcher polls,
+ * plus the host fence pointer used purely as a refresh key (never
+ * dereferenced by the watcher itself).  Records are allocated at bind
+ * time, marked dead on unregister, and closed+freed only by the
+ * watcher thread -- a poll in flight on the fd can never see it close
+ * under it. */
+struct npt_feedback_watch {
+   int fd;
+   void *host_obj;
+   bool dead;
+   struct list_head head;
 };
 
 /* Per-context feedback state, embedded in npt_context.  One mutex
@@ -115,6 +153,23 @@ struct npt_feedback_state {
    uint64_t last_poll_ns;
    uint64_t total_poll_ns;
    uint64_t poll_count;
+
+   /* Event-driven fence feedback: one watcher thread per context
+    * polls every armed fence's wait fd and refreshes the slot on a
+    * fire.  watch_mtx guards watches + watcher_stop (lock order:
+    * feedback.mutex -> watch_mtx; the watcher never holds watch_mtx
+    * across a refresh).  watch_ctl is a non-blocking pipe poked to
+    * make the watcher rebuild its poll set or exit. */
+   mtx_t watch_mtx;
+   struct list_head watches;
+   thrd_t watcher;
+   bool watcher_started;
+   bool watcher_stop;
+   int watch_ctl[2];
+
+   /* Arm events pinned at unregister because a SetEventOnCompletion
+    * registration may still fire late; kept for process life. */
+   uint32_t pinned_events;
 };
 
 void npt_feedback_init(struct npt_context *ctx);
@@ -234,15 +289,21 @@ void npt_feedback_fence_register(struct npt_context *ctx,
                                  uint32_t fence_api);
 
 /* Called from the Signal dispatch overrides after the host call
- * succeeds; host_fence is already resolved by the dispatcher.  Matches entries of either fence type.  `value` is the
- * value being signalled: it raises the entry's target_value, and the
- * poller drops the entry from pending once GetCompletedValue reaches
- * it.  Wakes the context's ring threads so an entry armed off the ring
- * thread can never be left unpolled.  No-op on miss, and on a fence the
- * poller has latched as rewound. */
+ * succeeds; host_fence is already resolved by the dispatcher.  Matches
+ * entries of either fence type.  `value` is the value being signalled:
+ * it raises the entry's target_value and, for a queue signal on an
+ * armed entry, arms a SetEventOnCompletion on the entry's event so the
+ * feedback watcher refreshes the slot when the GPU reaches it.  `queue`
+ * is the signalling queue's identity (the host queue/context pointer),
+ * or 0 for a CPU ID3D12Fence::Signal, which takes no part in the
+ * cross-queue rewind latch and already refreshes synchronously.  A
+ * second distinct queue or a requested value below the target latches
+ * the entry rewound: it stops arming and the guest reads the fence over
+ * the wire.  No-op on miss. */
 void npt_feedback_fence_mark_signal(struct npt_context *ctx,
                                     void *host_fence,
-                                    uint64_t value);
+                                    uint64_t value,
+                                    uintptr_t queue);
 
 /* Publish the fence's current host GetCompletedValue into its feedback
  * slot immediately, under the same state lock the poller uses, with the

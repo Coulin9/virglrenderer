@@ -66,7 +66,8 @@ npt_override_ID3D12CommandQueue_Signal(
 
    if (NPT_SUCCEEDED(args->ret) && args->pFence) {
       npt_feedback_fence_mark_signal(npt_context_from_dispatch(dctx),
-                                     args->pFence, args->Value);
+                                     args->pFence, args->Value,
+                                     (uintptr_t)args->_self);
    }
    return args->ret;
 }
@@ -114,7 +115,7 @@ npt_override_ID3D12Fence_Signal(
 
    if (NPT_SUCCEEDED(args->ret)) {
       struct npt_context *ctx = npt_context_from_dispatch(dctx);
-      npt_feedback_fence_mark_signal(ctx, args->_self, args->Value);
+      npt_feedback_fence_mark_signal(ctx, args->_self, args->Value, 0);
       /* CPU Signal completes before original returns, so the slot is
        * current by the time the reply reaches the guest. */
       npt_feedback_fence_refresh(ctx, args->_self);

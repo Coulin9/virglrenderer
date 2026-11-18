@@ -48,6 +48,18 @@ struct npt_event_proxy {
    uint32_t seoc_fence_count;
 };
 
+/* Platform backend for Win32-style events (npt_event_fd.c).  Shared by
+ * the guest event proxies below and by the fence-feedback arm events:
+ * both hand the signal handle to the D3D library's SetEventOnCompletion
+ * and poll a dup'd wait fd for the fire. */
+int npt_event_fd_create(struct npt_event_fd *out);
+void npt_event_fd_destroy(struct npt_event_fd *fd);
+void *npt_event_fd_signal_handle(const struct npt_event_fd *fd);
+int npt_event_fd_dup_wait_fd(const struct npt_event_fd *fd);
+bool npt_event_fd_drain_wait_fd(int fd);
+void npt_event_fd_init_invalid(struct npt_event_fd *fd);
+bool npt_event_fd_is_valid(const struct npt_event_fd *fd);
+
 struct npt_event_pending_arm {
    uint32_t ring_idx;
    int      dup_fd;         /* pop transfers ownership to the sync queue */

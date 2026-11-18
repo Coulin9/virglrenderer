@@ -8,10 +8,15 @@
 
 #include "npt_feedback.h"
 
+#include <errno.h>
 #include <inttypes.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "util/hash_table.h"
 
@@ -47,14 +52,55 @@ fb_equal_u64(const void *a, const void *b)
    return *(const uint64_t *)a == *(const uint64_t *)b;
 }
 
+static int npt_feedback_watcher_run(void *arg);
+static void npt_feedback_watch_poke(struct npt_context *ctx);
+static void npt_feedback_fence_unwatch_locked(struct npt_context *ctx,
+                                              struct npt_feedback_entry *entry);
+static void npt_feedback_fence_release_arm_locked(
+   struct npt_context *ctx, struct npt_feedback_entry *entry);
+static bool npt_feedback_fence_ensure_arm_locked(
+   struct npt_context *ctx, struct npt_feedback_entry *entry);
+
 void
 npt_feedback_init(struct npt_context *ctx)
 {
    struct npt_feedback_state *st = &ctx->feedback;
    memset(st, 0, sizeof(*st));
    mtx_init(&st->mutex, mtx_plain);
+   mtx_init(&st->watch_mtx, mtx_plain);
    list_inithead(&st->pending);
+   list_inithead(&st->watches);
+   st->watch_ctl[0] = -1;
+   st->watch_ctl[1] = -1;
    st->table = _mesa_hash_table_create(NULL, fb_hash_u64, fb_equal_u64);
+
+   /* Control pipe: the watcher rebuilds its poll set (or exits) only
+    * when poked, so binds and unregisters must reach it promptly. */
+   int fds[2];
+   if (pipe(fds) == 0) {
+      for (int i = 0; i < 2; i++) {
+         const int fl = fcntl(fds[i], F_GETFL);
+         if (fl >= 0)
+            fcntl(fds[i], F_SETFL, fl | O_NONBLOCK);
+         const int cl = fcntl(fds[i], F_GETFD);
+         if (cl >= 0)
+            fcntl(fds[i], F_SETFD, cl | FD_CLOEXEC);
+      }
+      st->watch_ctl[0] = fds[0];
+      st->watch_ctl[1] = fds[1];
+   }
+   if (st->watch_ctl[0] < 0) {
+      npt_log("feedback: watcher control pipe failed; fence arms disabled");
+      return;
+   }
+   st->watcher_started =
+      thrd_create(&st->watcher, npt_feedback_watcher_run, ctx) == thrd_success;
+   if (!st->watcher_started) {
+      close(st->watch_ctl[0]);
+      close(st->watch_ctl[1]);
+      st->watch_ctl[0] = st->watch_ctl[1] = -1;
+      npt_log("feedback: watcher thread failed; fence arms disabled");
+   }
 }
 
 void
@@ -64,16 +110,60 @@ npt_feedback_fini(struct npt_context *ctx)
    if (!st->table)
       return;
 
+   /* Stop the watcher first: it must not refresh an entry after the
+    * table is gone.  With the thread joined the watcher is no longer
+    * the sole fd closer, so leftover records are freed inline. */
+   if (st->watcher_started) {
+      mtx_lock(&st->watch_mtx);
+      st->watcher_stop = true;
+      mtx_unlock(&st->watch_mtx);
+      npt_feedback_watch_poke(ctx);
+      thrd_join(st->watcher, NULL);
+      st->watcher_started = false;
+   }
+   if (st->watch_ctl[0] >= 0) {
+      close(st->watch_ctl[0]);
+      close(st->watch_ctl[1]);
+      st->watch_ctl[0] = st->watch_ctl[1] = -1;
+   }
+   list_for_each_entry_safe(struct npt_feedback_watch, w, &st->watches,
+                            head) {
+      close(w->fd);
+      list_del(&w->head);
+      free(w);
+   }
+   mtx_destroy(&st->watch_mtx);
+
    mtx_lock(&st->mutex);
    hash_table_foreach(st->table, e) {
-      free(e->data);
+      struct npt_feedback_entry *entry = e->data;
+      npt_feedback_fence_release_arm_locked(ctx, entry);
+      free(entry);
    }
    _mesa_hash_table_destroy(st->table, NULL);
    st->table = NULL;
    list_inithead(&st->pending);
    st->pending_count = 0;
    mtx_unlock(&st->mutex);
+   if (st->pinned_events)
+      npt_log("feedback: %u arm event(s) pinned for late "
+              "SetEventOnCompletion fire", st->pinned_events);
    mtx_destroy(&st->mutex);
+}
+
+/* Wake the watcher so it rebuilds its poll set or observes the stop
+ * flag.  Non-blocking; a full pipe already means a wakeup is pending. */
+static void
+npt_feedback_watch_poke(struct npt_context *ctx)
+{
+   struct npt_feedback_state *st = &ctx->feedback;
+   if (st->watch_ctl[1] < 0)
+      return;
+   const uint8_t b = 1;
+   ssize_t n;
+   do {
+      n = write(st->watch_ctl[1], &b, sizeof(b));
+   } while (n < 0 && errno == EINTR);
 }
 
 void
@@ -167,6 +257,14 @@ npt_feedback_register_locked(struct npt_context *ctx,
       entry->host_ctx = NULL;
       entry->cookie = 0;
       entry->version = 0;
+      /* A reused fence entry keeps its arm event and watch rather
+       * than releasing and re-creating them: an outstanding arm's
+       * late fire is just an early refresh.  armed_value resets only
+       * when no registration can still be in flight; keeping it makes
+       * a stale fire refresh the new lifecycle's slot harmlessly. */
+      if (entry->published_high >= entry->armed_value)
+         entry->armed_value = 0;
+      entry->first_queue = 0;
       entry->target_value = 0;
       entry->published_high = 0;
       entry->persistent = false;
@@ -209,6 +307,8 @@ npt_feedback_unregister(struct npt_context *ctx, uint64_t obj_id)
    if (e) {
       struct npt_feedback_entry *entry = e->data;
       npt_feedback_clear_pending_locked(ctx, entry);
+      npt_feedback_fence_unwatch_locked(ctx, entry);
+      npt_feedback_fence_release_arm_locked(ctx, entry);
       _mesa_hash_table_remove(st->table, e);
       free(entry);
    }
@@ -228,9 +328,6 @@ npt_feedback_slot_ptr(struct npt_resource *res, uint32_t offset, uint32_t size)
 /* Forward decls for the type dispatch below. */
 static bool
 npt_feedback_query_poll_one(struct npt_context *ctx,
-                            struct npt_feedback_entry *entry);
-static bool
-npt_feedback_fence_poll_one(struct npt_context *ctx,
                             struct npt_feedback_entry *entry);
 
 void
@@ -278,10 +375,6 @@ npt_feedback_poll_interval(struct npt_context *ctx, uint64_t min_interval_ns)
       switch (entry->type) {
       case NPT_FEEDBACK_TYPE_QUERY:
          remove = npt_feedback_query_poll_one(ctx, entry);
-         break;
-      case NPT_FEEDBACK_TYPE_FENCE:
-      case NPT_FEEDBACK_TYPE_FENCE12:
-         remove = npt_feedback_fence_poll_one(ctx, entry);
          break;
       default:
          /* Unknown type: drop from pending so we don't spin; the
@@ -560,38 +653,108 @@ npt_feedback_fence_find_locked(struct npt_context *ctx, void *host_fence)
    return entry;
 }
 
+/* Caller holds state lock.  Latch the rewind flag for the same
+ * reason as the guest's cross-queue CAS: once the completed value can
+ * legally move backwards (a requested Signal below target, or a
+ * second distinct queue), the slot can no longer be trusted.
+ *
+ * The arm event and its watch stay: a late fire just drains and
+ * refreshes, which is harmless, and arming already stops because the
+ * entry is now rewound.  Releasing the event here would pin it for
+ * the process life whenever a registration is still outstanding, and
+ * a re-registered fence would leak one event per rewind. */
+static void
+npt_feedback_fence_latch_rewound_locked(
+   struct npt_context *ctx, struct npt_feedback_entry *entry)
+{
+   if (entry->rewound)
+      return;
+   entry->rewound = true;
+
+   struct npt_resource *res = npt_context_get_resource(ctx, entry->fb_res_id);
+   struct npt_d3d11_fence_feedback_slot *slot =
+      npt_feedback_slot_ptr(res, entry->fb_offset, sizeof(*slot));
+   if (slot)
+      atomic_fetch_or_explicit(&slot->flags, NPT_FENCE_FEEDBACK_FLAG_REWOUND,
+                               memory_order_release);
+
+   npt_log("fence feedback: obj 0x%" PRIx64 " rewound; guest reads it "
+           "over the wire from now on", entry->obj_id);
+}
+
 void
 npt_feedback_fence_mark_signal(struct npt_context *ctx, void *host_fence,
-                               uint64_t value)
+                               uint64_t value, uintptr_t queue)
 {
    if (!ctx || !host_fence || !ctx->feedback.table)
       return;
 
+   void *sig_handle = NULL;
+   uint8_t entry_type = 0;
+
    npt_feedback_state_lock(ctx);
    struct npt_feedback_entry *entry =
       npt_feedback_fence_find_locked(ctx, host_fence);
-   /* A fence the host has seen rewind owes no further polls: the guest
-    * reads such a fence over the wire rather than from the slot. */
-   const bool armed = entry && !entry->rewound;
-   if (armed) {
-      /* Raise the bar the poller has to clear before it may drop this
-       * entry.  Signals from different queues reach different ring
-       * threads and can be dispatched in either order, so only ever move
-       * the target forward. */
-      if (value > entry->target_value)
+   if (entry && !entry->rewound) {
+      /* Host-side rewind latch, matching the guest's first_queue CAS:
+       * two queues signalling one fence can execute their Signals in
+       * either order, so the completed value is no longer monotonic
+       * and the slot must not be trusted. */
+      if (queue) {
+         uintptr_t expected = 0;
+         const bool first = atomic_compare_exchange_strong(
+            (_Atomic uintptr_t *)&entry->first_queue, &expected, queue);
+         if (!first && expected != queue)
+            npt_feedback_fence_latch_rewound_locked(ctx, entry);
+      }
+      /* Signals from different queues reach different ring threads and
+       * can be dispatched in either order, so only ever move the target
+       * forward -- but a request below it is itself proof of a rewind. */
+      if (value < entry->target_value)
+         npt_feedback_fence_latch_rewound_locked(ctx, entry);
+      else if (value > entry->target_value)
          entry->target_value = value;
-      npt_feedback_set_pending_locked(ctx, entry);
+
+      /* Arm the entry's event for the new highest value.  CPU Signal
+       * (queue == 0) already refreshes synchronously after the host
+       * call, so arming is reserved for queue signals. */
+      if (!entry->rewound && queue &&
+          value > entry->armed_value &&
+          npt_feedback_fence_ensure_arm_locked(ctx, entry)) {
+         entry->armed_value = value;
+         sig_handle = npt_event_fd_signal_handle(&entry->arm_event);
+         entry_type = entry->type;
+      }
    }
    npt_feedback_state_unlock(ctx);
 
-   /* An armed entry is only ever observed by a ring thread's idle-gap
-    * poll, and that thread may be parked in an unbounded wait.  Signal
-    * usually runs on the ring thread itself, but dispatch can come from
-    * elsewhere, so tell every ring a poll is owed rather than relying on
-    * that.  After the state unlock: npt_ring_notify_feedback() takes
-    * ring->mutex, which the poll path nests the other way round. */
-   if (armed)
-      npt_context_notify_rings_feedback(ctx);
+   if (sig_handle) {
+      /* Deliberately outside the state lock: D3DMetal fires the event
+       * synchronously when the value is already reached, and the fire
+       * path (watcher -> refresh) takes that lock. */
+      HRESULT hr;
+      if (entry_type == NPT_FEEDBACK_TYPE_FENCE12) {
+         PFN_ID3D12Fence_SetEventOnCompletion seoc = NPT_COM_VTBL_FUNC(
+            PFN_ID3D12Fence_SetEventOnCompletion,
+            npt_com_vtable(host_fence),
+            NPT_VTBL_ID3D12Fence_SetEventOnCompletion);
+         hr = seoc(host_fence, value, (HANDLE)sig_handle);
+      } else {
+         PFN_ID3D11Fence_SetEventOnCompletion seoc = NPT_COM_VTBL_FUNC(
+            PFN_ID3D11Fence_SetEventOnCompletion,
+            npt_com_vtable(host_fence),
+            NPT_VTBL_ID3D11Fence_SetEventOnCompletion);
+         hr = seoc(host_fence, value, (HANDLE)sig_handle);
+      }
+      if (!NPT_SUCCEEDED(hr)) {
+         npt_log("fence feedback: SetEventOnCompletion failed "
+                 "(hr=0x%lx, value=%" PRIu64 "); refreshing once",
+                 (unsigned long)hr, value);
+         /* The arm is lost; publish what the fence holds now rather
+          * than leave the slot stale until the next Signal. */
+         npt_feedback_fence_refresh(ctx, host_fence);
+      }
+   }
 }
 
 /* Caller holds feedback state lock.  Host GetCompletedValue through
@@ -683,70 +846,201 @@ npt_feedback_fence_refresh(struct npt_context *ctx, void *host_fence)
    npt_feedback_state_unlock(ctx);
 }
 
-/* Per-type poller for fences.  Caller holds feedback state lock.
- *
- * Publishes the latest GetCompletedValue, then reports whether this
- * entry is done owing polls: true once the completed value has caught up
- * to the highest signalled target, false while an advance is still
- * outstanding.  Dropping the entry from pending loses nothing -- it
- * lives in the table until UNREGISTER and the next Signal re-arms it --
- * and lets pending_count reach zero, which is what a ring thread needs
- * to park rather than poll. */
+/* ================================================================== */
+/* Fence arm watcher                                                   */
+/* ================================================================== */
+
+/* A fence's completed value only changes when a Signal executes, so
+ * instead of polling GetCompletedValue every 100 us the host arms one
+ * event object per fence (the same kind the event-proxy path hands to
+ * SetEventOnCompletion) and a single per-context watcher thread
+ * refreshes the slot when an arm fires.  Lower arms firing early just
+ * refresh early, which is harmless. */
+
+/* Caller holds state lock.  Create the arm event and its watch record
+ * on first use.  The watch fd is a non-blocking dup of the event's
+ * pollable side; the record is owned by the watcher once linked. */
 static bool
-npt_feedback_fence_poll_one(struct npt_context *ctx,
-                            struct npt_feedback_entry *entry)
+npt_feedback_fence_ensure_arm_locked(struct npt_context *ctx,
+                                     struct npt_feedback_entry *entry)
 {
-   /* Entries reach pending only via the Signal hook, which always
-    * resolves host_obj first.  An unresolved entry here would be a
-    * Signal-hook bug; defensively skip. */
-   if (!entry->host_obj || !entry->fb_res_id)
+   struct npt_feedback_state *st = &ctx->feedback;
+   if (!st->watcher_started || !entry->host_obj)
       return false;
 
-   struct npt_resource *res = npt_context_get_resource(ctx, entry->fb_res_id);
-   struct npt_d3d11_fence_feedback_slot *slot =
-      npt_feedback_slot_ptr(res, entry->fb_offset, sizeof(*slot));
-   if (!slot)
-      return false;
-
-   /* The substrate poll holds st->mutex across this call so no two
-    * threads write the same slot concurrently; the release store
-    * publishes the value to the guest's local read.  Plain snapshot
-    * store, NOT a monotonic max: D3D12 fences may be legally rewound
-    * (Signal(lower)), and for monotonic D3D11 fences the snapshot is
-    * a valid lower bound anyway. */
-   const UINT64 val = npt_feedback_fence_host_value(entry);
-   atomic_store_explicit(&slot->completed_value, (uint64_t)val,
-                         memory_order_release);
-
-   /* D3D12 permits Signal to a lower value, and target_value only ever
-    * rises, so a rewound fence could never clear it again: latch the
-    * observation and stop owing polls, rather than hold every ring
-    * thread of this context in the 100 us feedback cadence for the rest
-    * of the session.  Latched on an observed decrease of the value
-    * itself, not on the requested one -- a Signal(lower) dispatched
-    * ahead of a concurrent Signal(higher) from another queue is
-    * ordinary reordering, not a rewind. */
-   if ((uint64_t)val < entry->published_high) {
-      entry->rewound = true;
-      atomic_fetch_or_explicit(&slot->flags, NPT_FENCE_FEEDBACK_FLAG_REWOUND,
-                               memory_order_release);
-      npt_log("fence feedback: obj 0x%" PRIx64 " rewound to %" PRIu64
-              " from %" PRIu64 "; guest reads it over the wire from now on",
-              entry->obj_id, (uint64_t)val, entry->published_high);
+   if (!entry->arm_event_valid) {
+      npt_event_fd_init_invalid(&entry->arm_event);
+      if (npt_event_fd_create(&entry->arm_event) < 0) {
+         npt_log("fence feedback: arm event create failed for obj 0x%"
+                 PRIx64, entry->obj_id);
+         return false;
+      }
+      entry->arm_event_valid = true;
+   }
+   if (entry->watch) {
+      /* A reused entry may have bound a new host fence since the watch
+       * was linked; the watcher refreshes by this pointer. */
+      if (entry->watch->host_obj != entry->host_obj) {
+         mtx_lock(&st->watch_mtx);
+         entry->watch->host_obj = entry->host_obj;
+         mtx_unlock(&st->watch_mtx);
+      }
       return true;
    }
-   entry->published_high = (uint64_t)val;
 
-   /* A D3D12 fence keeps owing polls after reaching its target: a
-    * lower-valued queue Signal dispatched earlier can still be in
-    * flight on another queue and execute after this point, rewinding
-    * the completed value with no further Signal to re-arm the entry.
-    * Only the poll observes that execution, so dropping the entry here
-    * would leave the slot stale-high until the next Signal -- and the
-    * guest reads the slot for GetCompletedValue.  D3D11 fences are
-    * monotonic, so reaching the target is a safe drop for them. */
-   if (entry->type == NPT_FEEDBACK_TYPE_FENCE12)
+   const int fd = npt_event_fd_dup_wait_fd(&entry->arm_event);
+   if (fd < 0) {
+      npt_log("fence feedback: dup(arm wait fd) failed for obj 0x%"
+              PRIx64, entry->obj_id);
       return false;
+   }
+   struct npt_feedback_watch *w = calloc(1, sizeof(*w));
+   if (!w) {
+      close(fd);
+      return false;
+   }
+   w->fd = fd;
+   w->host_obj = entry->host_obj;
+   mtx_lock(&st->watch_mtx);
+   list_addtail(&w->head, &st->watches);
+   mtx_unlock(&st->watch_mtx);
+   entry->watch = w;
+   npt_feedback_watch_poke(ctx);
+   return true;
+}
 
-   return (uint64_t)val >= entry->target_value;
+/* Caller holds state lock.  The record's fd must outlive any poll the
+ * watcher has in flight, so the watcher alone closes it: mark the
+ * record dead and poke; it is closed and freed on the next rebuild. */
+static void
+npt_feedback_fence_unwatch_locked(struct npt_context *ctx,
+                                  struct npt_feedback_entry *entry)
+{
+   struct npt_feedback_state *st = &ctx->feedback;
+   if (!entry->watch)
+      return;
+   mtx_lock(&st->watch_mtx);
+   entry->watch->dead = true;
+   mtx_unlock(&st->watch_mtx);
+   entry->watch = NULL;
+   npt_feedback_watch_poke(ctx);
+}
+
+/* Caller holds state lock.  There is no way to retract a
+ * SetEventOnCompletion, so the arm event is destroyed only when no
+ * registration on it can still be signalled: it was never armed, or
+ * every armed value is demonstrably consumed (the highest armed value
+ * already published, which means every lower registration fired too).
+ * Otherwise the event is pinned for the life of the process -- the
+ * same contract npt_event_fini gives gate events: a late fire must
+ * never hit a closed handle. */
+static void
+npt_feedback_fence_release_arm_locked(struct npt_context *ctx,
+                                      struct npt_feedback_entry *entry)
+{
+   if (!entry->arm_event_valid)
+      return;
+   const bool consumed =
+      !entry->armed_value || entry->published_high >= entry->armed_value;
+   if (consumed) {
+      npt_event_fd_destroy(&entry->arm_event);
+   } else {
+      ctx->feedback.pinned_events++;
+      npt_log("fence feedback: pinning arm event for obj 0x%" PRIx64
+              " (armed=%" PRIu64 " published=%" PRIu64
+              "); a pending registration may still fire",
+              entry->obj_id, entry->armed_value, entry->published_high);
+   }
+   entry->arm_event_valid = false;
+   npt_event_fd_init_invalid(&entry->arm_event);
+}
+
+/* Per-context watcher: poll() every armed fence's wait fd plus the
+ * control pipe; on a fire, drain the fd (the dup'd fds are
+ * O_NONBLOCK, and a drained pipe-mirror token is the reset for the
+ * manual-reset event, matching the gate path) and refresh the slot.
+ * watch records marked dead are closed and freed here, so an in-flight
+ * poll never sees its fd disappear. */
+static int
+npt_feedback_watcher_run(void *arg)
+{
+   struct npt_context *ctx = arg;
+   struct npt_feedback_state *st = &ctx->feedback;
+
+   for (;;) {
+      mtx_lock(&st->watch_mtx);
+      size_t n = 0;
+      list_for_each_entry(struct npt_feedback_watch, w, &st->watches,
+                          head) {
+         if (!w->dead)
+            n++;
+      }
+      struct pollfd *pfds = malloc((n + 1) * sizeof(*pfds));
+      void **objs = malloc(n * sizeof(*objs));
+      size_t cnt = 0;
+      if (pfds && objs) {
+         list_for_each_entry_safe(struct npt_feedback_watch, w,
+                                  &st->watches, head) {
+            if (w->dead) {
+               close(w->fd);
+               list_del(&w->head);
+               free(w);
+               continue;
+            }
+            pfds[cnt + 1].fd = w->fd;
+            pfds[cnt + 1].events = POLLIN;
+            pfds[cnt + 1].revents = 0;
+            objs[cnt] = w->host_obj;
+            cnt++;
+         }
+      }
+      const bool stop = st->watcher_stop;
+      mtx_unlock(&st->watch_mtx);
+
+      if (!pfds || !objs) {
+         free(pfds);
+         free(objs);
+         if (stop)
+            break;
+         /* Allocation failure: brief backoff, then rebuild. */
+         const struct timespec ts = { 0, 1000000 };
+         nanosleep(&ts, NULL);
+         continue;
+      }
+
+      pfds[0].fd = st->watch_ctl[0];
+      pfds[0].events = POLLIN;
+      pfds[0].revents = 0;
+
+      if (stop) {
+         free(pfds);
+         free(objs);
+         break;
+      }
+
+      const int r = poll(pfds, cnt + 1, -1);
+      if (r < 0 && errno != EINTR) {
+         free(pfds);
+         free(objs);
+         continue;
+      }
+      if (r > 0 && (pfds[0].revents & POLLIN)) {
+         uint8_t buf[64];
+         ssize_t rd;
+         do {
+            rd = read(st->watch_ctl[0], buf, sizeof(buf));
+         } while (rd > 0 || (rd < 0 && errno == EINTR));
+      }
+      for (size_t i = 0; i < cnt && r > 0; i++) {
+         if (pfds[i + 1].revents & (POLLIN | POLLERR | POLLHUP)) {
+            npt_event_fd_drain_wait_fd(pfds[i + 1].fd);
+            /* host_obj is a lookup key only: an entry unregistered
+             * since the rebuild simply misses the refresh. */
+            npt_feedback_fence_refresh(ctx, objs[i]);
+         }
+      }
+      free(pfds);
+      free(objs);
+   }
+   return 0;
 }

@@ -194,6 +194,7 @@ if with_neptune
    test_npt_queue_mode = executable(
       'test_npt_queue_mode',
       ['test_npt_queue_mode.c', '../src/neptune/npt_event.c',
+       '../src/neptune/npt_event_fd.c',
        '../src/neptune/npt_queue.c', '../src/neptune/npt_completion.c'],
       include_directories : include_directories(
          '..', '../src', '../src/mesa', '../src/mesa/compat',
@@ -201,6 +202,17 @@ if with_neptune
          '../src/gallium/include',
          '../subprojects/directx-native/include'))
    test('test_npt_queue_mode', test_npt_queue_mode)
+
+   test_npt_feedback_fence = executable(
+      'test_npt_feedback_fence',
+      ['test_npt_feedback_fence.c', '../src/neptune/npt_feedback.c',
+       '../src/neptune/npt_event_fd.c'],
+      include_directories : include_directories(
+         '..', '../src', '../src/mesa', '../src/mesa/compat',
+         '../src/neptune', '../src/gallium/auxiliary',
+         '../src/gallium/include',
+         '../subprojects/directx-native/include'))
+   test('test_npt_feedback_fence', test_npt_feedback_fence)
 
    test_npt_ring_decode = executable(
       'test_npt_ring_decode',
