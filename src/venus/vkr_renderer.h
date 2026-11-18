@@ -48,6 +48,9 @@ bool
 vkr_renderer_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size);
 
 bool
+vkr_renderer_ring_doorbell(uint32_t ctx_id, uint32_t ring_id);
+
+bool
 vkr_renderer_submit_fence(uint32_t ctx_id,
                           uint32_t flags,
                           uint64_t ring_idx,

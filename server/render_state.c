@@ -363,6 +363,10 @@ render_state_ring_doorbell(uint32_t ctx_id, uint32_t ring_id)
 
    SCOPE_LOCK_RENDERER();
    switch (ctx->backend) {
+#ifdef ENABLE_VENUS
+   case RENDER_BACKEND_VENUS:
+      return vkr_renderer_ring_doorbell(ctx_id, ring_id);
+#endif
 #ifdef ENABLE_NEPTUNE
    case RENDER_BACKEND_NEPTUNE:
       return npt_renderer_ring_doorbell(ctx_id, ring_id);

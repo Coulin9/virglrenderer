@@ -94,7 +94,7 @@ test_mask_and_conditional_wake(void)
       return;
 
    const uint32_t ctx_id = 7;
-   proxy_doorbell_register(ctx_id, ctl, wake);
+   proxy_doorbell_register(ctx_id, ctl, &ctl->oob_state, wake);
 
    /* consumer ACTIVE: bit is set but no signal is sent */
    atomic_store(&ctl->oob_state.value, RENDER_RING_ACTIVE);
@@ -164,7 +164,7 @@ test_concurrent_unregister(void)
       atomic_store(&ctl->oob_state.value, RENDER_RING_ACTIVE);
 
       const uint32_t ctx_id = 9;
-      proxy_doorbell_register(ctx_id, ctl, wake);
+      proxy_doorbell_register(ctx_id, ctl, &ctl->oob_state, wake);
 
       pthread_t th[8];
       struct hammer_args args[8];
@@ -231,7 +231,7 @@ test_no_lost_doorbell(void)
       return;
 
    const uint32_t ctx_id = 11;
-   proxy_doorbell_register(ctx_id, ctl, wake);
+   proxy_doorbell_register(ctx_id, ctl, &ctl->oob_state, wake);
 
    struct consumer_args cargs = {
       .ctl = ctl, .wake = wake,
@@ -299,6 +299,65 @@ test_drain_invokes_per_bit(void)
    free(ctl);
 }
 
+/* A context without an OOB ring registers its doorbell slot on the
+ * main consumer's state word and wake: the store must wake
+ * main_state, the bit must drain to the (backend) notify callback,
+ * and a ring landing while the main consumer races to sleep must not
+ * be lost. */
+static void
+test_main_consumer_domain(void)
+{
+   struct render_ring_control *ctl = ctl_create();
+   render_wake_t wake = wake_create();
+   CHECK(ctl && wake != RENDER_WAKE_NULL, "alloc failed");
+   if (!ctl || wake == RENDER_WAKE_NULL)
+      return;
+
+   const uint32_t ctx_id = 13;
+   proxy_doorbell_register(ctx_id, ctl, &ctl->main_state, wake);
+
+   /* ACTIVE: bit set, no signal. */
+   atomic_store(&ctl->main_state.value, RENDER_RING_ACTIVE);
+   CHECK(proxy_doorbell_ring(ctx_id, 7) == 0, "ring failed");
+   CHECK(atomic_load(&ctl->doorbell.mask[0]) == (UINT64_C(1) << 7),
+         "bit 7 not set");
+   CHECK(render_wake_wait(wake, 1000000) == false,
+         "spurious wake while ACTIVE");
+   /* The OOB consumer's state must be untouched. */
+   CHECK(atomic_load(&ctl->oob_state.value) == 0,
+         "oob_state touched by main-domain ring");
+
+   /* SLEEPING on main_state: ring flips it to WAKING and signals. */
+   atomic_store(&ctl->main_state.value, RENDER_RING_SLEEPING);
+   CHECK(proxy_doorbell_ring(ctx_id, 9) == 0, "ring failed");
+   CHECK(atomic_load(&ctl->main_state.value) == RENDER_RING_WAKING,
+         "main_state not WAKING");
+   CHECK(render_wake_wait(wake, 10000000) == true,
+         "missing wake while main consumer SLEEPING");
+
+   /* Drain invokes the notify hook once per bit, in id order. */
+   struct bit_rec rec = { .count = 0 };
+   render_ring_doorbell_drain(ctl, rec_cb, &rec);
+   CHECK(rec.count == 2 && rec.ids[0] == 7 && rec.ids[1] == 9,
+         "drain delivered %u bits", rec.count);
+   CHECK(!render_ring_doorbell_pending(ctl), "mask not drained");
+
+   /* Lost-wake check: consumer about to sleep marks SLEEPING then
+    * rechecks pending; a ring landing in the window must be seen. */
+   atomic_store(&ctl->main_state.value, RENDER_RING_SLEEPING);
+   CHECK(proxy_doorbell_ring(ctx_id, 5) == 0, "ring failed");
+   CHECK(render_ring_doorbell_pending(ctl) ||
+         atomic_load(&ctl->main_state.value) == RENDER_RING_WAKING,
+         "pre-sleep recheck missed the bit");
+   /* The producer must have signalled since it saw SLEEPING. */
+   CHECK(render_wake_wait(wake, 10000000) == true,
+         "lost wake racing to sleep");
+
+   proxy_doorbell_unregister(ctx_id);
+   wake_destroy(wake);
+   free(ctl);
+}
+
 int
 main(void)
 {
@@ -307,6 +366,7 @@ main(void)
    test_concurrent_unregister();
    test_no_lost_doorbell();
    test_drain_invokes_per_bit();
+   test_main_consumer_domain();
 
    if (failures) {
       fprintf(stderr, "test_npt_doorbell: %d failures\n", failures);

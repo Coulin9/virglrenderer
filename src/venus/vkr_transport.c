@@ -307,6 +307,37 @@ vkr_dispatch_vkNotifyRingMESA(struct vn_dispatch_context *dispatch,
    vkr_ring_notify(ring);
 }
 
+void
+vkr_context_ring_notify(struct vkr_context *ctx, uint64_t ring_id)
+{
+   struct vkr_ring *ring = lookup_ring(ctx, ring_id);
+   if (!ring) {
+      /* A guest ring can die between its doorbell store and our drain;
+       * that's benign, so warn once per context instead of per hit. */
+      static _Atomic uint64_t warned[4];
+      const uint32_t idx = ctx->ctx_id >> 6;
+      const uint64_t bit = 1ull << (ctx->ctx_id & 63);
+      if (ctx->ctx_id < 256 &&
+          !(atomic_fetch_or_explicit(&warned[idx], bit,
+                                     memory_order_relaxed) & bit))
+         vkr_log("ctx %u: doorbell for unknown ring %llu", ctx->ctx_id,
+                 (unsigned long long)ring_id);
+      return;
+   }
+
+   /* VIRGL_DEBUG_DOORBELL=1 traces every MMIO-doorbell notify; idle
+    * notifies are already rate-limited guest-side, so this stays
+    * quiet in practice. */
+   static int debug_doorbell = -1;
+   if (debug_doorbell < 0)
+      debug_doorbell = getenv("VIRGL_DEBUG_DOORBELL") != NULL;
+   if (debug_doorbell)
+      vkr_log("ctx %u: doorbell notify ring %llu", ctx->ctx_id,
+              (unsigned long long)ring_id);
+
+   vkr_ring_notify(ring);
+}
+
 static void
 vkr_dispatch_vkWriteRingExtraMESA(struct vn_dispatch_context *dispatch,
                                   struct vn_command_vkWriteRingExtraMESA *args)

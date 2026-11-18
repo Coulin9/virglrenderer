@@ -133,6 +133,11 @@ vkr_context_submit_fence(struct vkr_context *ctx,
 bool
 vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size);
 
+/* MMIO doorbell path: notify a ring by id without going through
+ * vkNotifyRingMESA dispatch.  Safe to call off the dispatch thread. */
+void
+vkr_context_ring_notify(struct vkr_context *ctx, uint64_t ring_id);
+
 bool
 vkr_context_create_resource(struct vkr_context *ctx,
                             uint32_t res_id,

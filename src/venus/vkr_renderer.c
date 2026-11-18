@@ -177,6 +177,19 @@ vkr_renderer_submit_fence(uint32_t ctx_id,
    return vkr_context_submit_fence(ctx, flags, ring_idx, fence_id);
 }
 
+/* MMIO doorbell: the guest stored a small ring id in its doorbell
+ * page instead of submitting vkNotifyRingMESA. */
+bool
+vkr_renderer_ring_doorbell(uint32_t ctx_id, uint32_t ring_id)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx)
+      return false;
+
+   vkr_context_ring_notify(ctx, ring_id);
+   return true;
+}
+
 bool
 vkr_renderer_create_resource(uint32_t ctx_id,
                              uint32_t res_id,

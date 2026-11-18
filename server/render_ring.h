@@ -818,17 +818,19 @@ render_ring_doorbell_pending(const struct render_ring_control *ctl)
 /* Producer side (VMM, called under the proxy slot's read lock so the
  * shared region can't be unmapped mid-store).  Follows the conditional
  * -wake producer rule: bit publish, seq_cst fence, then one signal only
- * if the OOB consumer is SLEEPING. */
+ * if the owning consumer is SLEEPING.  `state` is the consumer's state
+ * word: oob_state for OOB-ring contexts, main_state otherwise. */
 static inline void
 render_ring_doorbell_set(struct render_ring_control *ctl,
                          uint32_t ring_id,
-                         render_wake_t oob_wake)
+                         union render_ring_line *state,
+                         render_wake_t wake)
 {
    atomic_fetch_or_explicit(&ctl->doorbell.mask[ring_id >> 6],
                             UINT64_C(1) << (ring_id & 63),
                             memory_order_relaxed);
    atomic_thread_fence(memory_order_seq_cst);
-   render_ring_producer_wake(&ctl->oob_state.value, oob_wake, NULL);
+   render_ring_producer_wake(&state->value, wake, NULL);
 }
 
 /* Consumer side (worker OOB thread): swap every mask word with zero and

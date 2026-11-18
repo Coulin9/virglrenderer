@@ -1487,11 +1487,18 @@ proxy_context_create(uint32_t ctx_id,
       return NULL;
    }
 
-   /* Expose the context's ring-shm doorbell mask and OOB wake to the
-    * MMIO doorbell slot (Neptune only; ctx_ids >= slot count get no
-    * doorbell). */
-   if (ctx->has_oob_ring && ctx_id < PROXY_DOORBELL_SLOT_COUNT)
-      proxy_doorbell_register(ctx_id, ctx->ring, proxy_context_oob_wake(ctx));
+   /* Expose the context's ring-shm doorbell mask to the MMIO doorbell
+    * slot (ctx_ids >= slot count get no doorbell).  OOB-ring contexts
+    * (Neptune) wake the OOB consumer; everything else (Venus) shares
+    * the main consumer's wake domain. */
+   if (ctx_id < PROXY_DOORBELL_SLOT_COUNT) {
+      union render_ring_line *state =
+         ctx->has_oob_ring ? &ctx->ring->oob_state : &ctx->ring->main_state;
+      const render_wake_t wake = ctx->has_oob_ring
+                                    ? proxy_context_oob_wake(ctx)
+                                    : proxy_context_main_wake(ctx);
+      proxy_doorbell_register(ctx_id, ctx->ring, state, wake);
+   }
 
    return &ctx->base;
 }

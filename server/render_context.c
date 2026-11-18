@@ -559,14 +559,19 @@ fail:
 
 struct render_context_main_consumer {
    const struct render_ring_buf *r;
+   struct render_ring_control *ctl;
    uint32_t head;
+   /* Contexts without an OOB ring drain the MMIO doorbell mask on the
+    * main consumer, so its sleep/wake covers doorbell bits too. */
+   bool doorbell;
 };
 
 static bool
 render_context_main_has_work(void *opaque)
 {
    const struct render_context_main_consumer *c = opaque;
-   return atomic_load_explicit(c->r->tail, memory_order_acquire) != c->head;
+   return atomic_load_explicit(c->r->tail, memory_order_acquire) != c->head ||
+          (c->doorbell && render_ring_doorbell_pending(c->ctl));
 }
 
 static bool
@@ -574,7 +579,9 @@ render_context_ring_run(struct render_context *ctx)
 {
    struct render_context_main_consumer consumer = {
       .r = &ctx->main_ring,
+      .ctl = ctx->ring,
       .head = 0,
+      .doorbell = !ctx->oob_thread_created,
    };
 
    uint64_t spin_ns = RENDER_RING_DEFAULT_SPIN_NS;
@@ -660,6 +667,13 @@ render_context_ring_run(struct render_context *ctx)
          render_ring_commit(&ctx->main_ring, consumer.head);
       }
       render_ring_commit(&ctx->main_ring, consumer.head);
+
+      /* No-OOB contexts: drain MMIO doorbells while main_state still
+       * reads ACTIVE, so a bit landing just before the sleep check
+       * can't be lost -- the producer wakes on main_state. */
+      if (consumer.doorbell)
+         render_ring_doorbell_drain(ctx->ring,
+                                    render_context_oob_doorbell_cb, ctx);
 
 #if defined(__APPLE__)
       /* ring drained: park on the wake semaphore.  The watcher thread
