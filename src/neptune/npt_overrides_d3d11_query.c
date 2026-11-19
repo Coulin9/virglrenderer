@@ -54,8 +54,46 @@ npt_override_DC_GetData(struct npt_dispatch_context *dctx,
    return hr;
 }
 
+/* Ends recorded on a deferred context are not on the immediate
+ * timeline until the finished command list is executed.  Finish moves
+ * the context's pending records under the produced command list;
+ * Execute applies them, re-arming each query whose End just reached
+ * the immediate timeline. */
+static HRESULT
+npt_override_DC_FinishCommandList(
+   struct npt_dispatch_context *dctx,
+   struct npt_command_ID3D11DeviceContext_FinishCommandList *args,
+   PFN_ID3D11DeviceContext_FinishCommandList original)
+{
+   HRESULT hr = original(args->_self, args->RestoreDeferredContextState,
+                         args->ppCommandList);
+
+   struct npt_context *ctx = npt_context_from_dispatch(dctx);
+   if (ctx) {
+      void *list =
+         (hr == 0 && args->ppCommandList) ? *args->ppCommandList : NULL;
+      npt_feedback_query_finish_list(ctx, args->_self, list);
+   }
+   return hr;
+}
+
+static void
+npt_override_DC_ExecuteCommandList(
+   struct npt_dispatch_context *dctx,
+   struct npt_command_ID3D11DeviceContext_ExecuteCommandList *args,
+   PFN_ID3D11DeviceContext_ExecuteCommandList original)
+{
+   original(args->_self, args->pCommandList, args->RestoreContextState);
+
+   struct npt_context *ctx = npt_context_from_dispatch(dctx);
+   if (ctx)
+      npt_feedback_query_execute_list(ctx, args->pCommandList);
+}
+
 struct npt_dispatch_id3d11devicecontext_overrides
 npt_query_dc_overrides = {
    .End = npt_override_DC_End,
    .GetData = npt_override_DC_GetData,
+   .FinishCommandList = npt_override_DC_FinishCommandList,
+   .ExecuteCommandList = npt_override_DC_ExecuteCommandList,
 };

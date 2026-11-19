@@ -52,8 +52,36 @@ fb_equal_u64(const void *a, const void *b)
    return *(const uint64_t *)a == *(const uint64_t *)b;
 }
 
+/* The deferred-End / command-list tables key on host pointers. */
+static uint32_t
+fb_hash_ptr(const void *key)
+{
+   return fb_hash_u64(&(uint64_t){ (uintptr_t)key });
+}
+
+static bool
+fb_equal_ptr(const void *a, const void *b)
+{
+   return a == b;
+}
+
+/* One End decoded on a deferred context: the query's feedback obj_id
+ * and the entry version that End was counted as.  Lists of these are
+ * held under the deferred context until FinishCommandList, then under
+ * the host command list until ExecuteCommandList. */
+struct npt_deferred_query_end {
+   struct list_head head;
+   uint64_t obj_id;
+   uint32_t version;
+};
+
 static int npt_feedback_watcher_run(void *arg);
 static void npt_feedback_watch_poke(struct npt_context *ctx);
+static void npt_feedback_free_end_table(struct hash_table *t);
+static void npt_feedback_deferred_end_append(struct npt_context *ctx,
+                                             void *host_ctx,
+                                             uint64_t obj_id,
+                                             uint32_t version);
 static void npt_feedback_fence_unwatch_locked(struct npt_context *ctx,
                                               struct npt_feedback_entry *entry);
 static void npt_feedback_fence_release_arm_locked(
@@ -73,6 +101,10 @@ npt_feedback_init(struct npt_context *ctx)
    st->watch_ctl[0] = -1;
    st->watch_ctl[1] = -1;
    st->table = _mesa_hash_table_create(NULL, fb_hash_u64, fb_equal_u64);
+   st->deferred_ends =
+      _mesa_hash_table_create(NULL, fb_hash_ptr, fb_equal_ptr);
+   st->list_ends =
+      _mesa_hash_table_create(NULL, fb_hash_ptr, fb_equal_ptr);
 
    /* Control pipe: the watcher rebuilds its poll set (or exits) only
     * when poked, so binds and unregisters must reach it promptly. */
@@ -142,6 +174,10 @@ npt_feedback_fini(struct npt_context *ctx)
    }
    _mesa_hash_table_destroy(st->table, NULL);
    st->table = NULL;
+   npt_feedback_free_end_table(st->deferred_ends);
+   st->deferred_ends = NULL;
+   npt_feedback_free_end_table(st->list_ends);
+   st->list_ends = NULL;
    list_inithead(&st->pending);
    st->pending_count = 0;
    mtx_unlock(&st->mutex);
@@ -176,6 +212,24 @@ void
 npt_feedback_state_unlock(struct npt_context *ctx)
 {
    mtx_unlock(&ctx->feedback.mutex);
+}
+
+/* Free a pointer->record-list table and every record in it. */
+static void
+npt_feedback_free_end_table(struct hash_table *t)
+{
+   if (!t)
+      return;
+   hash_table_foreach(t, e) {
+      struct list_head *recs = e->data;
+      list_for_each_entry_safe(struct npt_deferred_query_end, r, recs,
+                               head) {
+         list_del(&r->head);
+         free(r);
+      }
+      free(recs);
+   }
+   _mesa_hash_table_destroy(t, NULL);
 }
 
 struct npt_feedback_entry *
@@ -257,6 +311,7 @@ npt_feedback_register_locked(struct npt_context *ctx,
       entry->host_ctx = NULL;
       entry->cookie = 0;
       entry->version = 0;
+      entry->submitted_version = 0;
       /* A reused fence entry keeps its arm event and watch rather
        * than releasing and re-creating them: an outstanding arm's
        * late fire is just an early refresh.  armed_value resets only
@@ -412,6 +467,13 @@ npt_feedback_query_poll_one(struct npt_context *ctx,
    if (entry->cookie > NPT_QUERY_FEEDBACK_SLOT_RESULT)
       return false;
 
+   /* The newest End hasn't reached the immediate timeline: a deferred
+    * context recorded it but its command list wasn't executed yet, and
+    * until then D3DMetal would report the query's previous result as
+    * S_OK.  Drop the poll; ExecuteCommandList re-arms the entry. */
+   if (entry->submitted_version != entry->version)
+      return true;
+
    struct npt_resource *res = npt_context_get_resource(ctx, entry->fb_res_id);
    struct npt_query_feedback_slot *slot =
       npt_feedback_slot_ptr(res, entry->fb_offset, sizeof(*slot));
@@ -472,14 +534,20 @@ npt_feedback_query_register(struct npt_context *ctx,
  * no result on a deferred one, so a deferred context resolves to its
  * device's immediate context.  The immediate context lives as long as
  * the device, like the raw host_ctx pointer kept here. */
-static void *
-npt_feedback_query_poll_ctx(void *host_ctx)
+static bool
+npt_feedback_query_ctx_is_deferred(void *host_ctx)
 {
    PFN_ID3D11DeviceContext_GetType get_type =
       NPT_COM_VTBL_FUNC(PFN_ID3D11DeviceContext_GetType,
                         npt_com_vtable(host_ctx),
                         NPT_VTBL_ID3D11DeviceContext_GetType);
-   if (get_type(host_ctx) != D3D11_DEVICE_CONTEXT_DEFERRED)
+   return get_type(host_ctx) == D3D11_DEVICE_CONTEXT_DEFERRED;
+}
+
+static void *
+npt_feedback_query_poll_ctx(void *host_ctx)
+{
+   if (!npt_feedback_query_ctx_is_deferred(host_ctx))
       return host_ctx;
 
    ID3D11Device *device = NULL;
@@ -533,6 +601,7 @@ npt_feedback_query_mark_end(struct npt_context *ctx,
          }
       }
    }
+   bool armed = false;
    if (match) {
       if (!match->host_ctx)
          match->host_ctx = npt_feedback_query_poll_ctx(host_ctx);
@@ -541,14 +610,134 @@ npt_feedback_query_mark_end(struct npt_context *ctx,
        * this on the result, so a result for an earlier End can never
        * satisfy a guest GetData for a later one. */
       match->version++;
-      npt_feedback_set_pending_locked(ctx, match);
+      if (npt_feedback_query_ctx_is_deferred(host_ctx)) {
+         /* A deferred End is not on the immediate timeline until its
+          * command list is executed; hold it back from the poll until
+          * ExecuteCommandList applies it. */
+         npt_feedback_deferred_end_append(ctx, host_ctx, match->obj_id,
+                                          match->version);
+      } else {
+         match->submitted_version = match->version;
+         npt_feedback_set_pending_locked(ctx, match);
+         armed = true;
+      }
    }
    npt_feedback_state_unlock(ctx);
 
    /* Only a ring thread polls, and it may be parked; tell it a poll is
     * owed.  After the state unlock: npt_ring_notify_feedback() takes
     * ring->mutex, which the poll path nests the other way round. */
-   if (match)
+   if (armed)
+      npt_context_notify_rings_feedback(ctx);
+}
+
+/* Append an unexecuted-End record under the deferred context that
+ * recorded it.  Caller holds the state lock. */
+static void
+npt_feedback_deferred_end_append(struct npt_context *ctx, void *host_ctx,
+                                 uint64_t obj_id, uint32_t version)
+{
+   struct npt_feedback_state *st = &ctx->feedback;
+   struct hash_entry *e =
+      _mesa_hash_table_search(st->deferred_ends, host_ctx);
+   struct list_head *recs = e ? e->data : NULL;
+   if (!recs) {
+      recs = malloc(sizeof(*recs));
+      if (!recs)
+         return;
+      list_inithead(recs);
+      _mesa_hash_table_insert(st->deferred_ends, host_ctx, recs);
+   }
+   struct npt_deferred_query_end *r = malloc(sizeof(*r));
+   if (!r)
+      return;
+   r->obj_id = obj_id;
+   r->version = version;
+   list_addtail(&r->head, recs);
+}
+
+/* Detach the record list keyed by `key` in `t` (or NULL).  Caller holds
+ * the state lock. */
+static struct list_head *
+npt_feedback_take_end_list(struct hash_table *t, const void *key)
+{
+   struct hash_entry *e = _mesa_hash_table_search(t, key);
+   if (!e)
+      return NULL;
+   struct list_head *recs = e->data;
+   _mesa_hash_table_remove(t, e);
+   return recs;
+}
+
+static void
+npt_feedback_free_end_recs(struct list_head *recs)
+{
+   if (!recs)
+      return;
+   list_for_each_entry_safe(struct npt_deferred_query_end, r, recs,
+                            head) {
+      list_del(&r->head);
+      free(r);
+   }
+   free(recs);
+}
+
+void
+npt_feedback_query_finish_list(struct npt_context *ctx, void *host_ctx,
+                               void *host_list)
+{
+   if (!ctx || !ctx->feedback.table)
+      return;
+   struct npt_feedback_state *st = &ctx->feedback;
+
+   npt_feedback_state_lock(ctx);
+   struct list_head *recs =
+      npt_feedback_take_end_list(st->deferred_ends, host_ctx);
+   if (host_list) {
+      /* Pointer reuse after release: replace whatever a previous list
+       * at this address left un-executed. */
+      npt_feedback_free_end_recs(
+         npt_feedback_take_end_list(st->list_ends, host_list));
+      if (recs)
+         _mesa_hash_table_insert(st->list_ends, host_list, recs);
+   } else {
+      npt_feedback_free_end_recs(recs);
+   }
+   npt_feedback_state_unlock(ctx);
+}
+
+void
+npt_feedback_query_execute_list(struct npt_context *ctx, void *host_list)
+{
+   if (!ctx || !host_list || !ctx->feedback.table)
+      return;
+   struct npt_feedback_state *st = &ctx->feedback;
+
+   npt_feedback_state_lock(ctx);
+   struct list_head *recs =
+      npt_feedback_take_end_list(st->list_ends, host_list);
+   bool armed = false;
+   if (recs) {
+      list_for_each_entry_safe(struct npt_deferred_query_end, r, recs,
+                               head) {
+         struct npt_feedback_entry *entry =
+            npt_feedback_lookup_locked(ctx, r->obj_id);
+         if (entry) {
+            if (entry->submitted_version < r->version)
+               entry->submitted_version = r->version;
+            if (entry->submitted_version == entry->version) {
+               npt_feedback_set_pending_locked(ctx, entry);
+               armed = true;
+            }
+         }
+         list_del(&r->head);
+         free(r);
+      }
+      free(recs);
+   }
+   npt_feedback_state_unlock(ctx);
+
+   if (armed)
       npt_context_notify_rings_feedback(ctx);
 }
 

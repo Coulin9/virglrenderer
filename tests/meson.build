@@ -214,6 +214,17 @@ if with_neptune
          '../subprojects/directx-native/include'))
    test('test_npt_feedback_fence', test_npt_feedback_fence)
 
+   test_npt_feedback_deferred = executable(
+      'test_npt_feedback_deferred',
+      ['test_npt_feedback_deferred.c', '../src/neptune/npt_feedback.c',
+       '../src/neptune/npt_event_fd.c'],
+      include_directories : include_directories(
+         '..', '../src', '../src/mesa', '../src/mesa/compat',
+         '../src/neptune', '../src/gallium/auxiliary',
+         '../src/gallium/include',
+         '../subprojects/directx-native/include'))
+   test('test_npt_feedback_deferred', test_npt_feedback_deferred)
+
    test_npt_desc_batch = executable(
       'test_npt_desc_batch',
       ['test_npt_desc_batch.c', '../src/neptune/npt_desc_batch.c',

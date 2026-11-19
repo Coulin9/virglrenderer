@@ -107,6 +107,13 @@ struct npt_feedback_entry {
 
    uint32_t cookie;
    uint32_t version;
+   /* Queries only: version of the newest End known to have reached the
+    * immediate timeline (immediate End at issue, or the deferred End's
+    * command list being executed).  A deferred End bumps version but is
+    * not submitted until ExecuteCommandList, and D3DMetal reports the
+    * query's previous result until then -- polling earlier would stamp
+    * old data under the new version. */
+   uint32_t submitted_version;
 
    uint64_t target_value;
    uint64_t published_high;
@@ -170,6 +177,14 @@ struct npt_feedback_state {
    /* Arm events pinned at unregister because a SetEventOnCompletion
     * registration may still fire late; kept for process life. */
    uint32_t pinned_events;
+
+   /* Query Ends decoded on deferred contexts.  deferred_ends maps the
+    * host deferred-context pointer to a list of {obj_id, version}
+    * records; FinishCommandList moves that list under the host command
+    * list pointer in list_ends, and ExecuteCommandList applies it.
+    * Pointer-keyed; guarded by `mutex` like table/pending. */
+   struct hash_table *deferred_ends;
+   struct hash_table *list_ends;
 };
 
 void npt_feedback_init(struct npt_context *ctx);
@@ -275,6 +290,20 @@ void npt_feedback_query_register(struct npt_context *ctx,
 void npt_feedback_query_mark_end(struct npt_context *ctx,
                                  void *host_ctx,
                                  void *host_query);
+
+/* Deferred-context FinishCommandList: moves the deferred context's
+ * unexecuted End records under the produced host command list
+ * (host_list NULL or the call failing drops them). */
+void npt_feedback_query_finish_list(struct npt_context *ctx,
+                                    void *host_ctx,
+                                    void *host_list);
+
+/* Immediate-context ExecuteCommandList: applies the command list's End
+ * records -- each query's submitted_version rises to the record's
+ * version and the entry goes pending once submitted reaches version.
+ * A list with no records is a no-op. */
+void npt_feedback_query_execute_list(struct npt_context *ctx,
+                                     void *host_list);
 
 /* ================================================================== */
 /* Fence feedback                                                      */
