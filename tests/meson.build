@@ -27,6 +27,7 @@ check_dep = dependency('check', required : false)
 # and do not need check, so they build regardless.
 ring_tests = [
    ['test_render_ring', 'test_render_ring.c'],
+   ['test_npt_backend_tag', 'test_npt_backend_tag.c'],
 ]
 
 foreach t : ring_tests

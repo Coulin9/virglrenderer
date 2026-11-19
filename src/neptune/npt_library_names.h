@@ -38,6 +38,37 @@ npt_mullion_selected(void)
 #endif
 }
 
+/* AppleDeck per-context backend routing: a tagged guest context names itself
+ * "ad:d:<exe>" (d3dmetal) or "ad:m:<exe>" (mullion). The tag is an allowlist
+ * keyword only -- never a filesystem path. The guest-side writer lives in
+ * virtio-win-mesa's unixlib and must stay in sync with these spellings. */
+#define NPT_APPLEDECK_TAG_LEN 5
+
+static inline const char *
+npt_appledeck_ctx_backend(const char *ctx_name)
+{
+   if (!ctx_name)
+      return NULL;
+   if (!strncmp(ctx_name, "ad:d:", NPT_APPLEDECK_TAG_LEN))
+      return "d3dmetal";
+   if (!strncmp(ctx_name, "ad:m:", NPT_APPLEDECK_TAG_LEN))
+      return "mullion";
+   return NULL;
+}
+
+/* Host-provided allowlist variable holding the validated adapter path for a
+ * tagged backend. Set by the launcher only when that backend passed startup
+ * validation, so a guest tag can never steer a worker to an untrusted path. */
+static inline const char *
+npt_appledeck_adapter_env(const char *backend)
+{
+   if (!strcmp(backend, "d3dmetal"))
+      return "NPT_APPLEDECK_D3DMETAL_ADAPTER";
+   if (!strcmp(backend, "mullion"))
+      return "NPT_APPLEDECK_MULLION_ADAPTER";
+   return NULL;
+}
+
 #if defined(__APPLE__) && defined(__aarch64__)
 #define NPT_D3D11_LIBRARY_DEFAULT "libdxmt-native.dylib"
 #define NPT_DXGI_LIBRARY_DEFAULT  "libdxmt-native.dylib"

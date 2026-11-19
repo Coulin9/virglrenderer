@@ -133,20 +133,45 @@ render_spawn_worker(const struct render_context_args *ctx_args,
    }
 
    /* Venus, DXMT and Mullion use arm64. D3DMetal uses x86_64 under Rosetta.
-    * CPU_TYPE_ANY lets a thin build fall back to its available slice. */
+    * CPU_TYPE_ANY lets a thin untagged build fall back to its available
+    * slice; a tagged context requires the exact architecture. */
    cpu_type_t worker_arch = CPU_TYPE_ARM64;
+   bool tagged = false;
    if (ctx_args->init_flags & VIRGL_RENDERER_NEPTUNE) {
-      const char *backend = getenv("NPT_BACKEND");
-      const bool use_dxmt = backend && !strcmp(backend, "dxmt");
-      const bool native_backend = use_dxmt || npt_mullion_selected();
-      if (backend && *backend && !native_backend && strcmp(backend, "d3dmetal"))
-         render_spawn_log("unknown NPT_BACKEND '%s', using d3dmetal", backend);
-      worker_arch = native_backend ? CPU_TYPE_ARM64 : CPU_TYPE_X86_64;
+      const char *tag_backend = npt_appledeck_ctx_backend(ctx_args->ctx_name);
+      if (tag_backend) {
+         /* An explicitly tagged context must route to the validated adapter
+          * for that backend or fail closed -- never silently fall back to the
+          * inherited default. */
+         const char *env_name = npt_appledeck_adapter_env(tag_backend);
+         const char *adapter = env_name ? getenv(env_name) : NULL;
+         if (!adapter || !*adapter) {
+            render_spawn_log("refusing tagged context '%s': %s is not set",
+                             ctx_args->ctx_name, env_name ? env_name : "?");
+            posix_spawnattr_destroy(&attr);
+            return -1;
+         }
+         worker_arch = !strcmp(tag_backend, "d3dmetal") ? CPU_TYPE_X86_64
+                                                       : CPU_TYPE_ARM64;
+         tagged = true;
+      } else {
+         const char *backend = getenv("NPT_BACKEND");
+         const bool use_dxmt = backend && !strcmp(backend, "dxmt");
+         const bool native_backend = use_dxmt || npt_mullion_selected();
+         if (backend && *backend && !native_backend && strcmp(backend, "d3dmetal"))
+            render_spawn_log("unknown NPT_BACKEND '%s', using d3dmetal", backend);
+         worker_arch = native_backend ? CPU_TYPE_ARM64 : CPU_TYPE_X86_64;
+      }
    }
    cpu_type_t cpu_pref[] = { worker_arch, CPU_TYPE_ANY };
    cpu_subtype_t cpu_subpref[] = { CPU_SUBTYPE_ANY, CPU_SUBTYPE_ANY };
    size_t ocount = 0;
-   posix_spawnattr_setarchpref_np(&attr, 2, cpu_pref, cpu_subpref, &ocount);
+   if (posix_spawnattr_setarchpref_np(&attr, tagged ? 1 : 2, cpu_pref,
+                                      cpu_subpref, &ocount) != 0 || !ocount) {
+      render_spawn_log("failed to constrain worker architecture");
+      posix_spawnattr_destroy(&attr);
+      return -1;
+   }
 
    posix_spawn_file_actions_t file_actions;
    if (posix_spawn_file_actions_init(&file_actions) != 0) {
