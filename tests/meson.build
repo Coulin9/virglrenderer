@@ -214,6 +214,17 @@ if with_neptune
          '../subprojects/directx-native/include'))
    test('test_npt_feedback_fence', test_npt_feedback_fence)
 
+   test_npt_desc_batch = executable(
+      'test_npt_desc_batch',
+      ['test_npt_desc_batch.c', '../src/neptune/npt_desc_batch.c',
+       '../src/neptune/npt_cs.c'],
+      include_directories : include_directories(
+         '..', '../src', '../src/mesa', '../src/mesa/compat',
+         '../src/neptune', '../src/gallium/auxiliary',
+         '../src/gallium/include',
+         '../subprojects/directx-native/include'))
+   test('test_npt_desc_batch', test_npt_desc_batch)
+
    test_npt_ring_decode = executable(
       'test_npt_ring_decode',
       ['test_npt_ring_decode.c', '../src/neptune/npt_ring.c',

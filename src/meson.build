@@ -112,6 +112,7 @@ neptune_sources = [
    'neptune/npt_completion.c',
    'neptune/npt_context.c',
    'neptune/npt_cs.c',
+   'neptune/npt_desc_batch.c',
    'neptune/npt_feedback.c',
    'neptune/npt_event.c',
    'neptune/npt_event_fd.c',

@@ -29,6 +29,7 @@
 #define NPT_TRANSPORT_SUBGROUP_SHARED   4u  /* shared / presentable textures*/
 #define NPT_TRANSPORT_SUBGROUP_EVENT    5u  /* Win32 event bridge           */
 #define NPT_TRANSPORT_SUBGROUP_FEEDBACK 6u  /* shmem feedback (query, fence)*/
+#define NPT_TRANSPORT_SUBGROUP_DESC     7u  /* batched descriptor writes    */
 
 #define NPT_TRANSPORT_CMD_TYPE(subgroup, method) \
    NPT_CMD_TYPE_TOPLEVEL(NPT_TRANSPORT_GROUP, \
@@ -738,5 +739,52 @@ struct npt_cmd_register_fence_feedback {
    uint32_t fence_api;
    uint32_t pad;
 };
+
+/* ====================================================================== */
+/* DESC -- batched D3D12 descriptor writes                                */
+/* ====================================================================== */
+
+/* Replaces a run of single descriptor-write commands in a thread's
+ * staged output.  The guest coalesces inside its per-thread stage, so
+ * the batch occupies the same wire position -- and inherits the same
+ * ordering -- as the individual commands it stands in for.  Async. */
+#define NPT_TRANSPORT_DESC_BATCH 0u
+
+#define NPT_DESC_BATCH_COPY_SIMPLE 1u  /* ID3D12Device::CopyDescriptorsSimple */
+#define NPT_DESC_BATCH_CREATE_CBV  2u  /* ID3D12Device::CreateConstantBufferView */
+
+/* In-place extension stops at this count, capping one wire command. */
+#define NPT_DESC_BATCH_MAX_ENTRIES 256u
+
+struct npt_desc_copy_entry {
+   uint64_t dst;   /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */
+   uint64_t src;   /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */
+   uint32_t num;
+   uint32_t _pad;
+};
+
+struct npt_desc_cbv_entry {
+   uint64_t buffer_location; /* D3D12_CONSTANT_BUFFER_VIEW_DESC fields */
+   uint32_t size_in_bytes;
+   uint32_t has_desc;        /* 0 -> NULL desc on the host call */
+   uint64_t dst;             /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr */
+};
+
+struct npt_cmd_desc_batch {
+   struct npt_command_header header;  /* cmd_size covers entries */
+   uint64_t device_id;                /* ID3D12Device object id */
+   uint32_t kind;                     /* NPT_DESC_BATCH_* */
+   uint32_t heap_type;                /* COPY_SIMPLE only; 0 for CBV */
+   uint32_t count;
+   uint32_t _pad;
+   /* followed by count entries */
+};
+
+_Static_assert(sizeof(struct npt_desc_copy_entry) == 24,
+               "npt_desc_copy_entry size");
+_Static_assert(sizeof(struct npt_desc_cbv_entry) == 24,
+               "npt_desc_cbv_entry size");
+_Static_assert(sizeof(struct npt_cmd_desc_batch) == 48,
+               "npt_cmd_desc_batch size");
 
 #endif /* NPT_PROTOCOL_TRANSPORT_H */

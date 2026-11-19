@@ -12,6 +12,7 @@
 #include "npt_com.h"
 #include "npt_context.h"
 #include "npt_cs.h"
+#include "npt_desc_batch.h"
 #include "npt_event.h"
 #include "npt_feedback.h"
 #include "npt_heap12.h"
@@ -936,6 +937,12 @@ npt_transport_dispatch(struct npt_context *ctx,
       break;
    case NPT_TRANSPORT_SUBGROUP_FEEDBACK:
       matched = npt_dispatch_subgroup_feedback(ctx, dec, header, method);
+      break;
+   case NPT_TRANSPORT_SUBGROUP_DESC:
+      if (method == NPT_TRANSPORT_DESC_BATCH) {
+         npt_transport_desc_batch(ctx, dispatch, dec, header);
+         matched = true;
+      }
       break;
    default:
       break;
