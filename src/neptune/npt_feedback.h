@@ -152,6 +152,13 @@ struct npt_feedback_watch {
 struct npt_feedback_state {
    mtx_t mutex;
    struct hash_table *table;       /* obj_id -> npt_feedback_entry */
+   struct hash_table *by_host;     /* host_obj -> npt_feedback_entry */
+
+   /* Entries of each kind whose host_obj is still unresolved.  The
+    * by_host lookups fall back to a lazy-bind scan only while the
+    * matching count is non-zero. */
+   uint32_t unresolved_queries;
+   uint32_t unresolved_fences;
 
    struct list_head pending;
    uint32_t pending_count;
@@ -229,8 +236,8 @@ void npt_feedback_set_pending_locked(struct npt_context *ctx,
 void npt_feedback_clear_pending_locked(struct npt_context *ctx,
                                        struct npt_feedback_entry *entry);
 
-/* First entry matching host_obj and type, or NULL.  Linear scan;
- * registered counts are small.  Caller holds state lock. */
+/* Entry matching host_obj and type, or NULL.  Indexed by by_host.
+ * Caller holds state lock. */
 struct npt_feedback_entry *
 npt_feedback_lookup_by_host_obj_locked(struct npt_context *ctx,
                                        void *host_obj,

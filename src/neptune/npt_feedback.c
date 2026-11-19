@@ -78,6 +78,7 @@ struct npt_deferred_query_end {
 static int npt_feedback_watcher_run(void *arg);
 static void npt_feedback_watch_poke(struct npt_context *ctx);
 static void npt_feedback_free_end_table(struct hash_table *t);
+static bool npt_feedback_type_is_fence(uint8_t type);
 static void npt_feedback_deferred_end_append(struct npt_context *ctx,
                                              void *host_ctx,
                                              uint64_t obj_id,
@@ -101,6 +102,8 @@ npt_feedback_init(struct npt_context *ctx)
    st->watch_ctl[0] = -1;
    st->watch_ctl[1] = -1;
    st->table = _mesa_hash_table_create(NULL, fb_hash_u64, fb_equal_u64);
+   st->by_host =
+      _mesa_hash_table_create(NULL, fb_hash_ptr, fb_equal_ptr);
    st->deferred_ends =
       _mesa_hash_table_create(NULL, fb_hash_ptr, fb_equal_ptr);
    st->list_ends =
@@ -174,6 +177,10 @@ npt_feedback_fini(struct npt_context *ctx)
    }
    _mesa_hash_table_destroy(st->table, NULL);
    st->table = NULL;
+   _mesa_hash_table_destroy(st->by_host, NULL);
+   st->by_host = NULL;
+   st->unresolved_queries = 0;
+   st->unresolved_fences = 0;
    npt_feedback_free_end_table(st->deferred_ends);
    st->deferred_ends = NULL;
    npt_feedback_free_end_table(st->list_ends);
@@ -246,15 +253,51 @@ npt_feedback_lookup_by_host_obj_locked(struct npt_context *ctx,
                                        uint8_t type)
 {
    struct npt_feedback_state *st = &ctx->feedback;
-   if (!st->table || !host_obj)
+   if (!st->by_host || !host_obj)
       return NULL;
 
-   hash_table_foreach(st->table, e) {
-      struct npt_feedback_entry *entry = e->data;
-      if (entry->type == type && entry->host_obj == host_obj)
-         return entry;
+   struct hash_entry *e = _mesa_hash_table_search(st->by_host, host_obj);
+   if (!e)
+      return NULL;
+   struct npt_feedback_entry *entry = e->data;
+   return entry->type == type ? entry : NULL;
+}
+
+/* Caller holds state lock.  Tracks the unresolved counts that gate
+ * the lazy-bind scans. */
+static void
+npt_feedback_account_unresolved_locked(struct npt_feedback_state *st,
+                                       uint8_t type, int delta)
+{
+   if (npt_feedback_type_is_fence(type))
+      st->unresolved_fences += delta;
+   else
+      st->unresolved_queries += delta;
+}
+
+/* Caller holds state lock.  The only writer of entry->host_obj: keeps
+ * by_host and the unresolved counts consistent.  The old mapping is
+ * dropped only while it still names this entry, so a host pointer a
+ * later registration recycled is never stolen back. */
+static void
+npt_feedback_bind_host_locked(struct npt_context *ctx,
+                              struct npt_feedback_entry *entry,
+                              void *host_obj)
+{
+   struct npt_feedback_state *st = &ctx->feedback;
+   if (entry->host_obj && st->by_host) {
+      struct hash_entry *e =
+         _mesa_hash_table_search(st->by_host, entry->host_obj);
+      if (e && e->data == entry)
+         _mesa_hash_table_remove(st->by_host, e);
    }
-   return NULL;
+   if (!entry->host_obj && host_obj)
+      npt_feedback_account_unresolved_locked(st, entry->type, -1);
+   else if (entry->host_obj && !host_obj)
+      npt_feedback_account_unresolved_locked(st, entry->type, +1);
+   entry->host_obj = host_obj;
+   if (host_obj && st->by_host)
+      _mesa_hash_table_insert(st->by_host, host_obj, entry);
 }
 
 void
@@ -303,11 +346,19 @@ npt_feedback_register_locked(struct npt_context *ctx,
        * Clear type-specific fields so a stale resolve from the
        * previous registration can't leak through. */
       npt_feedback_clear_pending_locked(ctx, entry);
+      /* A re-register may switch kinds (query vs fence): keep the
+       * unresolved count of an unbound entry under its new kind. */
+      if (!entry->host_obj &&
+          npt_feedback_type_is_fence(entry->type) !=
+             npt_feedback_type_is_fence(type)) {
+         npt_feedback_account_unresolved_locked(st, entry->type, -1);
+         npt_feedback_account_unresolved_locked(st, type, +1);
+      }
       entry->type = type;
       entry->fb_res_id = fb_res_id;
       entry->fb_offset = fb_offset;
       entry->slot_size = slot_size;
-      entry->host_obj = NULL;
+      npt_feedback_bind_host_locked(ctx, entry, NULL);
       entry->host_ctx = NULL;
       entry->cookie = 0;
       entry->version = 0;
@@ -344,6 +395,7 @@ npt_feedback_register_locked(struct npt_context *ctx,
    entry->slot_size = slot_size;
    list_inithead(&entry->pending_head);
    _mesa_hash_table_insert(st->table, &entry->obj_id, entry);
+   npt_feedback_account_unresolved_locked(st, type, +1);
    /* Keep mutex held: caller sets type-specific fields. */
    return entry;
 }
@@ -364,6 +416,11 @@ npt_feedback_unregister(struct npt_context *ctx, uint64_t obj_id)
       npt_feedback_clear_pending_locked(ctx, entry);
       npt_feedback_fence_unwatch_locked(ctx, entry);
       npt_feedback_fence_release_arm_locked(ctx, entry);
+      /* The bind's bound->NULL count-in assumes the entry stays
+       * registered; this one leaves the table, so it must not count
+       * as unresolved either way. */
+      npt_feedback_bind_host_locked(ctx, entry, NULL);
+      npt_feedback_account_unresolved_locked(st, entry->type, -1);
       _mesa_hash_table_remove(st->table, e);
       free(entry);
    }
@@ -581,20 +638,31 @@ npt_feedback_query_mark_end(struct npt_context *ctx,
       return;
 
    npt_feedback_state_lock(ctx);
-   /* Linear scan: registered query counts are small in practice. */
+   /* Indexed by host_obj; only entries registered but not yet bound
+    * to a host pointer take the lazy-resolve scan, and only while any
+    * query entry is still unresolved. */
+   struct npt_feedback_state *st = &ctx->feedback;
    struct npt_feedback_entry *match = NULL;
-   hash_table_foreach(ctx->feedback.table, e) {
-      struct npt_feedback_entry *entry = e->data;
-      if (entry->type != NPT_FEEDBACK_TYPE_QUERY)
-         continue;
-      if (entry->host_obj == host_query) {
-         match = entry;
-         break;
+   if (st->by_host) {
+      struct hash_entry *he =
+         _mesa_hash_table_search(st->by_host, host_query);
+      if (he) {
+         struct npt_feedback_entry *entry = he->data;
+         if (entry->type == NPT_FEEDBACK_TYPE_QUERY)
+            match = entry;
       }
-      /* Resolve host_obj from guest_id on first encounter. */
-      if (!entry->host_obj) {
-         entry->host_obj = npt_context_lookup_object(
-            ctx, NULL, entry->obj_id, NPT_OBJECT_TYPE_IUNKNOWN);
+   }
+   if (!match && (st->unresolved_queries || !st->by_host)) {
+      hash_table_foreach(st->table, e) {
+         struct npt_feedback_entry *entry = e->data;
+         if (entry->type != NPT_FEEDBACK_TYPE_QUERY)
+            continue;
+         /* Resolve host_obj from guest_id on first encounter. */
+         if (!entry->host_obj)
+            npt_feedback_bind_host_locked(
+               ctx, entry,
+               npt_context_lookup_object(ctx, NULL, entry->obj_id,
+                                         NPT_OBJECT_TYPE_IUNKNOWN));
          if (entry->host_obj == host_query) {
             match = entry;
             break;
@@ -792,8 +860,10 @@ npt_feedback_fence_register(struct npt_context *ctx,
     * resolved lazily on first Signal. */
    entry->persistent = true;
    if (!entry->host_obj)
-      entry->host_obj = npt_context_lookup_object(
-         ctx, NULL, entry->obj_id, NPT_OBJECT_TYPE_IUNKNOWN);
+      npt_feedback_bind_host_locked(
+         ctx, entry,
+         npt_context_lookup_object(ctx, NULL, entry->obj_id,
+                                   NPT_OBJECT_TYPE_IUNKNOWN));
    npt_feedback_publish_live_locked(ctx, entry);
    npt_feedback_state_unlock(ctx);
 }
@@ -802,34 +872,41 @@ static void npt_feedback_publish_live_locked(struct npt_context *ctx,
                                              struct npt_feedback_entry *entry);
 
 /* Caller holds state lock.  Resolve the fence feedback entry for a
- * host fence pointer: cached host_obj match first, then lazy bind
- * through the object table for entries not yet bound.  Linear scans;
- * fence counts are small. */
+ * host fence pointer: by_host hit first, then lazy bind through the
+ * object table for entries not yet bound, only while a fence entry
+ * is still unresolved.  Both fence types share one host pointer
+ * namespace, so the index matches either. */
 static struct npt_feedback_entry *
 npt_feedback_fence_find_locked(struct npt_context *ctx, void *host_fence)
 {
    /* Fast path: entry's host_obj already resolved (every Signal
-    * after the first hits this).  Both fence types share one host
-    * pointer namespace, so scan for either. */
+    * after the first hits this). */
+   struct npt_feedback_state *st = &ctx->feedback;
    struct npt_feedback_entry *entry = NULL;
-   hash_table_foreach(ctx->feedback.table, e) {
-      struct npt_feedback_entry *cand = e->data;
-      if (npt_feedback_type_is_fence(cand->type) &&
-          cand->host_obj == host_fence) {
-         entry = cand;
-         break;
+   if (st->by_host) {
+      struct hash_entry *he =
+         _mesa_hash_table_search(st->by_host, host_fence);
+      if (he) {
+         struct npt_feedback_entry *cand = he->data;
+         if (npt_feedback_type_is_fence(cand->type))
+            entry = cand;
       }
    }
-   if (!entry) {
+   if (!entry && (st->unresolved_fences || !st->by_host)) {
       /* First-time resolve: fence registered before any Signal hasn't
-       * had host_obj cached.  Walk fence entries with NULL host_obj
-       * and bind via the object table. */
-      hash_table_foreach(ctx->feedback.table, e) {
+       * had host_obj cached.  Walk unbound fence entries and bind via
+       * the object table (with by_host absent, bound entries are
+       * matched here too). */
+      hash_table_foreach(st->table, e) {
          struct npt_feedback_entry *cand = e->data;
-         if (!npt_feedback_type_is_fence(cand->type) || cand->host_obj)
+         if (!npt_feedback_type_is_fence(cand->type) ||
+             (cand->host_obj && st->by_host))
             continue;
-         cand->host_obj = npt_context_lookup_object(
-            ctx, NULL, cand->obj_id, NPT_OBJECT_TYPE_IUNKNOWN);
+         if (!cand->host_obj)
+            npt_feedback_bind_host_locked(
+               ctx, cand,
+               npt_context_lookup_object(ctx, NULL, cand->obj_id,
+                                         NPT_OBJECT_TYPE_IUNKNOWN));
          npt_feedback_publish_live_locked(ctx, cand);
          if (cand->host_obj == host_fence) {
             entry = cand;

@@ -203,6 +203,9 @@ struct fake_ctx {
 
 static struct fake_ctx imm_obj, def_a, def_b;
 static int fake_query;
+/* Distinct fake host objects for the many-entry cases: id 1000..2099
+ * map to one array element each. */
+static int fake_objs[1100];
 
 static void
 fake_vtbls_init(void)
@@ -245,6 +248,8 @@ npt_context_lookup_object(struct npt_context *ctx,
    (void)ctx; (void)dec; (void)expected;
    if (id == 42)
       return &fake_query;
+   if (id >= 1000 && id < 2100)
+      return &fake_objs[id - 1000];
    return NULL;
 }
 
@@ -490,6 +495,87 @@ main(void)
    npt_feedback_query_mark_end(ctx, &def_b, &fake_query);   /* v5 */
    npt_feedback_query_mark_end(ctx, &def_a, &fake_query);   /* v6 */
    npt_feedback_query_finish_list(ctx, &def_a, NULL);
+
+   npt_feedback_fini(ctx);
+   _mesa_hash_table_destroy(ctx->resource_table, NULL);
+   mtx_destroy(&ctx->resource_mutex);
+   free(ctx);
+
+   /* (5) Indexed host-pointer lookup: with 1000 live queries an End
+    * resolves through by_host (or the lazy bind on first encounter),
+    * so only the right entry's version advances. */
+   ctx = calloc(1, sizeof(*ctx));
+   if (!ctx)
+      return 1;
+   ctx->ctx_id = 10;
+   mtx_init(&ctx->resource_mutex, mtx_plain);
+   ctx->resource_table =
+      _mesa_hash_table_create(NULL, u32_key_hash, u32_key_equal);
+   _mesa_hash_table_insert(ctx->resource_table, &fake_res.res_id,
+                          &fake_res);
+   npt_feedback_init(ctx);
+
+   const uint32_t n_queries = 1000;
+   for (uint32_t i = 0; i < n_queries; i++)
+      npt_feedback_query_register(ctx, 1000 + i, 7, 0, sizeof(BOOL));
+
+   /* Pseudo-random order over a spread of the registered ids. */
+   static const uint32_t order[] = { 777, 3, 512, 999, 128, 640, 41 };
+   for (uint32_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+      const uint64_t id = 1000 + order[i];
+      const uint32_t before = ctx->feedback.pending_count;
+      npt_feedback_query_mark_end(ctx, &imm_obj, &fake_objs[order[i]]);
+      npt_feedback_state_lock(ctx);
+      struct npt_feedback_entry *e =
+         npt_feedback_lookup_locked(ctx, id);
+      npt_feedback_state_unlock(ctx);
+      CHECK(e && e->version == 1 && e->pending,
+            "indexed mark_end armed only the matching entry");
+      CHECK(ctx->feedback.pending_count == before + 1,
+            "indexed mark_end pended exactly one entry");
+   }
+
+   /* Re-register drops the host binding; the next End lazily re-binds
+    * the same host pointer to the same obj_id. */
+   const uint32_t re_id = 1000 + order[0];
+   npt_feedback_query_register(ctx, re_id, 7, 0, sizeof(BOOL));
+   {
+      npt_feedback_state_lock(ctx);
+      struct npt_feedback_entry *e =
+         npt_feedback_lookup_locked(ctx, re_id);
+      npt_feedback_state_unlock(ctx);
+      CHECK(e && e->version == 0 && !e->pending,
+            "re-register reset version and pending");
+   }
+   npt_feedback_query_mark_end(ctx, &imm_obj, &fake_objs[order[0]]);
+   {
+      npt_feedback_state_lock(ctx);
+      struct npt_feedback_entry *e =
+         npt_feedback_lookup_locked(ctx, re_id);
+      npt_feedback_state_unlock(ctx);
+      CHECK(e && e->version == 1,
+            "re-registered entry re-bound its host pointer");
+   }
+
+   /* Unregister removes the by_host mapping: a mark_end for the
+    * recycled host pointer must not arm any entry (the lazy scan
+    * resolves everyone else and still finds no match). */
+   const uint32_t dead_id = 1000 + order[1];
+   void *dead_host = &fake_objs[order[1]];
+   npt_feedback_unregister(ctx, dead_id);
+   {
+      const uint32_t before = ctx->feedback.pending_count;
+      npt_feedback_query_mark_end(ctx, &imm_obj, dead_host);
+      CHECK(ctx->feedback.pending_count == before,
+            "stale host pointer matched nothing after unregister");
+   }
+   /* A never-registered host pointer is likewise a miss. */
+   {
+      const uint32_t before = ctx->feedback.pending_count;
+      npt_feedback_query_mark_end(ctx, &imm_obj, &fake_query);
+      CHECK(ctx->feedback.pending_count == before,
+            "unregistered host pointer matched nothing");
+   }
 
    npt_feedback_fini(ctx);
    _mesa_hash_table_destroy(ctx->resource_table, NULL);
