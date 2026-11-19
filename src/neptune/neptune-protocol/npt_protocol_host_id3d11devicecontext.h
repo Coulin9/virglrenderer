@@ -16576,7 +16576,6 @@ struct npt_command_ID3D11DeviceContext_FinishCommandList {
      * this field and inserts {_guest_id_ppCommandList -> *ppCommandList} in the
      * context object table. */
     uint64_t _guest_id_ppCommandList;
-    struct npt_wire_object_ref _ref_ppCommandList;
     HRESULT ret;
 };
 
@@ -16618,7 +16617,7 @@ npt_encode_ID3D11DeviceContext_FinishCommandList_reply(struct npt_cs_encoder *en
         .cmd_return = (uint32_t)args->ret,
     };
     npt_cs_encoder_write(enc, sizeof(_reply), &_reply, sizeof(_reply));
-npt_encode_npt_wire_object_ref(enc, &args->_ref_ppCommandList);
+/* skip args->ppCommandList (guest-allocated id, registered host-side; not in reply) */
 }
 
 static inline void
@@ -16696,8 +16695,10 @@ npt_dispatch_ID3D11DeviceContext_FinishCommandList(struct npt_dispatch_context *
      * later commands that reference them can be validated.  A void**
      * output takes its type from the REFIID input paired with it.  A
      * canonical method's slots are answered into the reply refs. */
-    if (args.ppCommandList)
-        npt_cs_handle_register_canonical_guest_id(ctx, args._guest_id_ppCommandList, *args.ppCommandList, NPT_OBJECT_TYPE_ID3D11COMMANDLIST, &args._ref_ppCommandList);
+    if (args.ppCommandList && *args.ppCommandList)
+        npt_cs_handle_register_guest_id(ctx, args._guest_id_ppCommandList, *args.ppCommandList, NPT_OBJECT_TYPE_ID3D11COMMANDLIST);
+    else if (args.ppCommandList)
+        npt_cs_handle_register_failed_guest_id(ctx, args._guest_id_ppCommandList);
 
     if (cmd_flags & NPT_CMD_FLAG_REPLY) {
         if (!npt_cs_decoder_get_fatal(ctx->decoder)) {
