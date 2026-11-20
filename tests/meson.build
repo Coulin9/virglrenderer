@@ -180,7 +180,7 @@ if with_neptune
       exe = executable(t[0], t[1],
                        include_directories : neptune_test_inc,
                        dependencies : neptune_test_depends)
-      test(t[0], exe, env : neptune_test_env)
+      test(t[0], exe, env : neptune_test_env, depends : virgl_render_server)
    endforeach
 
    test_npt_completion = executable(
